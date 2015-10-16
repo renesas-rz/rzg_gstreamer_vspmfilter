@@ -1060,10 +1060,16 @@ gst_vspm_filter_finalize (GObject * obj)
   
   if (space->vspm_in)
     g_free (space->vspm_in);
+  /* free buf_array when finalize */
+  if (space->vspm_outbuf->buf_array)
+    g_ptr_array_free(space->vspm_outbuf->buf_array, TRUE);
   if (space->vspm_out)
     g_free (space->vspm_out);
   if (space->vspm_outbuf)
     g_free (space->vspm_outbuf);
+  /* free space->allocator when finalize */
+  if (space->allocator)
+    gst_object_unref(space->allocator);
 
   G_OBJECT_CLASS (parent_class)->finalize (obj);
 }
