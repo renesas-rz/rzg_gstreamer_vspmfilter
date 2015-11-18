@@ -106,11 +106,13 @@ struct _GstVspmFilterVspInfo {
   guint  in_width;
   guint  in_height;
   guint  in_nplane;
+  guint  in_swapbit;
   GstVideoFormat gst_format_out;
   guint  out_format;
   guint  out_width;
   guint  out_height;
   guint  out_nplane;
+  guint  out_swapbit;
   int mmngr_fd;   /* mmngr open id */
   
 };
