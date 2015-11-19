@@ -70,22 +70,6 @@ volatile unsigned char end_flag = 0;  /* wait vspm-callback flag */
 G_DEFINE_TYPE (GstVspmFilter, gst_vspm_filter, GST_TYPE_VIDEO_FILTER);
 #define CLEAR(x) memset (&(x), 0, sizeof (x))
 
-#define CSP_VIDEO_CAPS GST_VIDEO_CAPS_MAKE (GST_VIDEO_FORMATS_ALL)
-
-static GstStaticPadTemplate gst_vspm_filter_src_template =
-GST_STATIC_PAD_TEMPLATE ("src",
-    GST_PAD_SRC,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (CSP_VIDEO_CAPS)
-    );
-
-static GstStaticPadTemplate gst_vspm_filter_sink_template =
-GST_STATIC_PAD_TEMPLATE ("sink",
-    GST_PAD_SINK,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (CSP_VIDEO_CAPS)
-    );
-
 static void gst_vspm_filter_set_property (GObject * object,
     guint property_id, const GValue * value, GParamSpec * pspec);
 static void gst_vspm_filter_get_property (GObject * object,
@@ -312,8 +296,8 @@ struct extensions_t
   guint vsp_swap;
 };
 
-/* Note that below swap information will be reversed later (in set_colorspace)
- *     because current system use Little Endian */
+/* Note that below swap information will be REVERSED later (in function
+ *     set_colorspace) because current system use Little Endian */
 static const struct extensions_t exts[] = {
   {GST_VIDEO_FORMAT_I420,  VSP_IN_YUV420_PLANAR,     VSP_SWAP_NO},
   {GST_VIDEO_FORMAT_YUY2,  VSP_IN_YUV422_INT0_YUY2,  VSP_SWAP_NO},
@@ -1002,6 +986,14 @@ static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * t
 static void
 gst_vspm_filter_class_init (GstVspmFilterClass * klass)
 {
+  int nr_exts;
+  int i;
+  GstCaps* incaps;
+  GstCaps* outcaps;
+  GstCaps* tmpcaps;
+  GstPadTemplate* gst_vspm_filter_src_template;
+  GstPadTemplate* gst_vspm_filter_sink_template;
+
   GObjectClass *gobject_class = (GObjectClass *) klass;
   GstElementClass *gstelement_class = (GstElementClass *) klass;
   GstBaseTransformClass *gstbasetransform_class =
@@ -1012,10 +1004,43 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
   gobject_class->get_property = gst_vspm_filter_get_property;
   gobject_class->finalize = gst_vspm_filter_finalize;
 
+  incaps  = gst_caps_new_empty();
+  outcaps = gst_caps_new_empty();
+
+  nr_exts = sizeof (exts) / sizeof (exts[0]);
+  for (i = 0; i < nr_exts; i++) {
+	tmpcaps = gst_caps_new_simple ("video/x-raw",
+            "format", G_TYPE_STRING, gst_video_format_to_string (exts[i].gst_format),
+            "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+            "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+            "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+
+    gst_caps_append (incaps, tmpcaps);
+  }
+
+  nr_exts = sizeof (exts_out) / sizeof (exts_out[0]);
+  for (i = 0; i < nr_exts; i++) {
+	tmpcaps = gst_caps_new_simple ("video/x-raw",
+            "format", G_TYPE_STRING, gst_video_format_to_string (exts_out[i].gst_format),
+            "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+            "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+            "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+
+    gst_caps_append (outcaps, tmpcaps);
+  }
+
+  gst_vspm_filter_src_template = gst_pad_template_new ("src",
+		GST_PAD_SRC, GST_PAD_ALWAYS, incaps);
+  gst_vspm_filter_sink_template = gst_pad_template_new ("sink",
+		GST_PAD_SINK, GST_PAD_ALWAYS, outcaps);
+
   gst_element_class_add_pad_template (gstelement_class,
-      gst_static_pad_template_get (&gst_vspm_filter_src_template));
+      gst_vspm_filter_src_template);
   gst_element_class_add_pad_template (gstelement_class,
-      gst_static_pad_template_get (&gst_vspm_filter_sink_template));
+      gst_vspm_filter_sink_template);
+
+  gst_caps_unref (incaps);
+  gst_caps_unref (outcaps);
 
   gst_element_class_set_static_metadata (gstelement_class,
       "Colorspace and Video Size Converter with VSPM",
