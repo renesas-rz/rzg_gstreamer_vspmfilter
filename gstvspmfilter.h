@@ -115,26 +115,6 @@ struct _GstVspmFilterVspInfo {
   
 };
 
-/**
- * GstVspmFilter:
- *
- * Opaque object data structure.
- */
-struct _GstVspmFilter {
-  GstVideoFilter element;
-
-  GstVspmFilterVspInfo *vsp_info;
-  GstAllocator *allocator;
-  guint use_dmabuf;
-  GstBufferPool *in_port_pool, *out_port_pool;
-};
-
-struct _GstVspmFilterClass
-{
-  GstVideoFilterClass parent_class;
-};
-
-
 typedef struct {
   int mmng_pid;
   int dmabuf_pid;
@@ -154,6 +134,30 @@ typedef struct {
 GPtrArray *buf_array;
 gint current_buffer_index;
 }VspmbufArray ;
+
+/**
+ * GstVspmFilter:
+ *
+ * Opaque object data structure.
+ */
+struct _GstVspmFilter {
+  GstVideoFilter element;
+
+  GstVspmFilterVspInfo *vsp_info;
+  GstAllocator *allocator;
+  guint use_dmabuf;
+  guint outbuf_allocate;
+  GstBufferPool *in_port_pool, *out_port_pool;
+  Vspm_mmng_ar *vspm_in;
+  Vspm_mmng_ar *vspm_out;
+  VspmbufArray *vspm_outbuf;
+  gint first_buff;
+};
+
+struct _GstVspmFilterClass
+{
+  GstVideoFilterClass parent_class;
+};
 
 G_END_DECLS
 
