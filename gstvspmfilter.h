@@ -50,6 +50,8 @@ G_BEGIN_DECLS
 #define GST_IS_VIDEO_CONVERT(obj)         (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_VIDEO_CONVERT))
 #define GST_IS_VIDEO_CONVERT_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_VIDEO_CONVERT))
 #define GST_VIDEO_CONVERT_CAST(obj)       ((GstVspmFilter *)(obj))
+#define GST_TYPE_VSPMFILTER_BUFFER_POOL     (gst_vspmfilter_buffer_pool_get_type())
+#define GST_VSPMFILTER_BUFFER_POOL_CAST(obj) ((GstVspmFilterBufferPool*)(obj))
 
 #define N_BUFFERS 1
 
@@ -77,6 +79,22 @@ typedef struct _GstVspmFilter GstVspmFilter;
 typedef struct _GstVspmFilterClass GstVspmFilterClass;
 
 typedef struct _GstVspmFilterVspInfo GstVspmFilterVspInfo;
+typedef struct _GstVspmFilterBufferPool GstVspmFilterBufferPool;
+typedef struct _GstVspmFilterBufferPoolClass GstVspmFilterBufferPoolClass;
+
+struct _GstVspmFilterBufferPool
+{
+  GstBufferPool bufferpool;
+
+  GstVspmFilter *vspmfilter;
+
+  GstCaps *caps;
+};
+
+struct _GstVspmFilterBufferPoolClass
+{
+  GstBufferPoolClass parent_class;
+};
 
 struct buffer {
   void *start;
@@ -133,8 +151,8 @@ typedef struct {
 } Vspm_mmng_ar;
 
 typedef struct {
-GPtrArray *buf_array;
-gint current_buffer_index;
+  GPtrArray *buf_array;
+  gint current_buffer_index;
 }VspmbufArray ;
 
 /**
@@ -160,6 +178,8 @@ struct _GstVspmFilterClass
 {
   GstVideoFilterClass parent_class;
 };
+
+GType gst_vspmfilter_buffer_pool_get_type (void);
 
 G_END_DECLS
 
