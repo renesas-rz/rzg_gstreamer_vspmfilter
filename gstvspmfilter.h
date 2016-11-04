@@ -137,7 +137,7 @@ struct _GstVspmFilterVspInfo {
 
 typedef struct {
   int mmng_pid;
-  int dmabuf_pid;
+  int dmabuf_pid[GST_VIDEO_MAX_PLANES];
   unsigned long pphy_addr;
   unsigned long phard_addr;
   unsigned long puser_virt_addr;
