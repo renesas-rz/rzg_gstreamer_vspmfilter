@@ -131,7 +131,8 @@ struct _GstBaseTransformPrivate
 enum
 {
   PROP_0,
-  PROP_VSPM_OUTBUF
+  PROP_VSPM_OUTBUF,
+  PROP_VSPM_DMABUF
 };
 
 static gboolean
@@ -782,6 +783,10 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
       g_param_spec_boolean ("outbuf-alloc", "Use outbuf-alloc mode",
         "Whether or not to self-allocate output buffer",
         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_VSPM_DMABUF,
+      g_param_spec_boolean ("dmabuf-use", "Use DMABUF mode",
+        "This setting was removed",
+        FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   gstelement_class->change_state = gst_vspmfilter_change_state;
   gstbasetransform_class->transform_caps =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_transform_caps);
@@ -940,6 +945,9 @@ gst_vspm_filter_set_property (GObject * object, guint property_id,
     case PROP_VSPM_OUTBUF:
       space->outbuf_allocate = g_value_get_boolean (value);
       break;
+    case PROP_VSPM_DMABUF:
+      printf ("WARNING: vspmfilter: dmabuf-use was removed, dmabuf is now supported in mode outbuf-alloc=true\n");
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -954,6 +962,8 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
   switch (property_id) {
     case PROP_VSPM_OUTBUF:
       g_value_set_boolean (value, space->outbuf_allocate);
+      break;
+    case PROP_VSPM_DMABUF:
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
