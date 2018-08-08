@@ -983,11 +983,12 @@ static void cb_func(
 }
 
 static GstFlowReturn
-find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer base1,
-    gpointer in_vir2, gpointer base2, gpointer *out_phy1, gpointer *out_phy2)
+find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
+    gpointer *out_phy1, gpointer *out_phy2)
 {
-  struct MM_PARAM      p_adr[2];
+  struct MM_PARAM p_adr[2];
   GstFlowReturn ret;
+  gint page_size, max_size_in_page;
 
   /* change virtual address to physical address */
   memset(&p_adr, 0, sizeof(p_adr));
@@ -999,10 +1000,14 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer base1,
     GST_ERROR ("MMNGR VtoP Convert Error. \n");
     return GST_FLOW_ERROR;
   }
-  /* Note that this method to find physical address only find the address in
+  /* Note that this method to find physical address may only find the address at
    * start of page. If there is an offset from page, we need to add it here */
-  p_adr[0].hard_addr += (0xFFF & ((unsigned long)in_vir1 - (unsigned long)base1));
-  p_adr[1].hard_addr += (0xFFF & ((unsigned long)in_vir2 - (unsigned long)base2));
+  page_size = getpagesize ();
+  max_size_in_page = page_size - 1;
+  if ((p_adr[0].hard_addr & max_size_in_page) == 0)
+    p_adr[0].hard_addr += (max_size_in_page & (unsigned long)in_vir1);
+  if ((p_adr[1].hard_addr & max_size_in_page) == 0)
+    p_adr[1].hard_addr += (max_size_in_page & (unsigned long)in_vir2);
 
   if (out_phy1 != NULL) *out_phy1 = (gpointer) p_adr[0].hard_addr;
   if (out_phy2 != NULL) *out_phy2 = (gpointer) p_adr[1].hard_addr;
@@ -1092,18 +1097,18 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     use_module = VSP_UDS_USE;
   }
 
-  ret = find_physical_address (space, in_frame->data[0], in_frame->map[0].data,
-      out_frame->data[0], out_frame->map[0].data, &src_addr[0], &dst_addr[0]);
+  ret = find_physical_address (space, in_frame->data[0], out_frame->data[0],
+      &src_addr[0], &dst_addr[0]);
   if (ret != GST_FLOW_OK) return ret;
 
   if (in_n_planes >= 2 || out_n_planes >= 2) {
-    ret = find_physical_address (space, in_frame->data[1], in_frame->map[1].data,
-        out_frame->data[1], out_frame->map[1].data, &src_addr[1], &dst_addr[1]);
+    ret = find_physical_address (space, in_frame->data[1], out_frame->data[1],
+        &src_addr[1], &dst_addr[1]);
     if (ret != GST_FLOW_OK) return ret;
   }
   if (in_n_planes >= 3 || out_n_planes >= 3) {
-    ret = find_physical_address (space, in_frame->data[2], in_frame->map[2].data,
-        out_frame->data[2], out_frame->map[2].data, &src_addr[2], &dst_addr[2]);
+    ret = find_physical_address (space, in_frame->data[2], out_frame->data[2],
+        &src_addr[2], &dst_addr[2]);
     if (ret != GST_FLOW_OK) return ret;
   }
 
