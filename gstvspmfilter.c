@@ -926,7 +926,7 @@ gst_vspm_filter_init (GstVspmFilter * space)
   vspm_outbuf->buf_array = g_ptr_array_new ();  
   vspm_outbuf->current_buffer_index = 0;
   space->allocator = gst_dmabuf_allocator_new ();
-  space->outbuf_allocate = TRUE;
+  space->outbuf_allocate = FALSE;
   space->use_dmabuf = FALSE;
   space->first_buff = 1;
 
