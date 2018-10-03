@@ -803,6 +803,8 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
   gstbasetransform_class->transform_meta =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_transform_meta);
 
+  gstbasetransform_class->passthrough_on_same_caps = TRUE;
+
   gstbasetransform_class->prepare_output_buffer = 
       GST_DEBUG_FUNCPTR (gst_vspm_filter_prepare_output_buffer);
   gstvideofilter_class->set_info =
