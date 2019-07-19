@@ -1210,8 +1210,18 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     /* Set T_VSP_UDS. */
     ctrl_par.uds     = &uds_par;
     memset(&uds_par, 0, sizeof(T_VSP_UDS));
-    uds_par.fmd      = VSP_FMD;
+    uds_par.fmd      = VSP_FMD_NO;
     uds_par.filcolor = 0x0000FF00; /* green */
+	uds_par.amd      = VSP_AMD;
+
+	uds_par.clip		= VSP_CLIP_OFF;
+	uds_par.alpha		= VSP_ALPHA_ON;
+	uds_par.complement	= VSP_COMPLEMENT_BIL;
+	uds_par.athres0		= 0;
+	uds_par.athres1		= 0;
+	uds_par.anum0		= 0;
+	uds_par.anum1		= 0;
+	uds_par.anum2	= 0;
 
     uds_par.x_ratio     = (unsigned short)( (in_width << 12) / out_width );
     uds_par.y_ratio     = (unsigned short)( (in_height << 12) / out_height );
