@@ -30,6 +30,7 @@
 
 #include <fcntl.h>              /* low-level i/o */
 #include <unistd.h>
+#include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -172,6 +173,7 @@ struct _GstVspmFilter {
   Vspm_mmng_ar *vspm_out;
   VspmbufArray *vspm_outbuf;
   gint first_buff;
+  sem_t smp_wait;
 };
 
 struct _GstVspmFilterClass

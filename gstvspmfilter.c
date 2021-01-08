@@ -3,7 +3,7 @@
  * This file:
  * Copyright (C) 2003 Ronald Bultje <rbultje@ronald.bitfreak.net>
  * Copyright (C) 2010 David Schleef <ds@schleef.org>
- * Copyright (C) 2014 Renesas Corporation
+ * Copyright (C) 2014-2020 Renesas Electronics Corporation
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -63,8 +63,6 @@ GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
 GType gst_vspm_filter_get_type (void);
 
 static GQuark _colorspace_quark;
-
-volatile unsigned char end_flag = 0;  /* wait vspm-callback flag */
 
 #define gst_vspm_filter_parent_class parent_class
 G_DEFINE_TYPE (GstVspmFilter, gst_vspm_filter, GST_TYPE_VIDEO_FILTER);
@@ -876,6 +874,7 @@ gst_vspm_filter_finalize (GObject * obj)
   if (space->allocator)
     gst_object_unref(space->allocator);
 
+  sem_destroy (&space->smp_wait);
   G_OBJECT_CLASS (parent_class)->finalize (obj);
 }
 
@@ -940,6 +939,8 @@ gst_vspm_filter_init (GstVspmFilter * space)
     for (j = 0; j < GST_VIDEO_MAX_PLANES; j++)
       vspm_out->vspm[i].dmabuf_pid[j] = -1;
   }
+
+  sem_init (&space->smp_wait, 0, 0);
 }
 
 void
@@ -988,10 +989,13 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
 static void cb_func(
   unsigned long uwJobId, long wResult, unsigned long uwUserData)
 {
+  sem_t *p_smpwait = (sem_t *) uwUserData;
+
   if (wResult != 0) {
     printf("VSPM: error end. (%ld)\n", wResult);
   }
-  end_flag = 1;
+  /* Inform frame finish to transform function */
+  sem_post (p_smpwait);
 }
 
 static GstFlowReturn
@@ -1244,17 +1248,15 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   vspm_ip.uhType    = VSPM_TYPE_VSP_AUTO;
   vspm_ip.unionIpParam.ptVsp = &vsp_par;
 
-  end_flag = 0;
-  ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, 0, cb_func); 
+  ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
   if (ercd) {
     printf("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     return GST_FLOW_ERROR;
   }
 
-  while(1) {
-    if (end_flag) break;
-  }
+  /* Wait for callback */
+  sem_wait (&space->smp_wait);
 
   return GST_FLOW_OK;
 }
