@@ -136,49 +136,6 @@ enum
   PROP_VSPM_DMABUF
 };
 
-static gboolean
-gst_vspmfilter_buffer_pool_set_config (GstBufferPool * pool, GstStructure * config)
-{
-  GstVspmFilterBufferPool *vspmfltpool = GST_VSPMFILTER_BUFFER_POOL_CAST (pool);
-  GstCaps *caps;
-  gint width, height;
-  guint size = 0;
-  guint min_buffers;
-  guint max_buffers;
-  GstVideoInfo info;
-  gint stride[GST_VIDEO_MAX_PLANES] = { 0 };
-  guint i;
-
-  if (!gst_buffer_pool_config_get_params (config, &caps, NULL, &min_buffers,
-          &max_buffers)) {
-    GST_WARNING_OBJECT (pool, "invalid config");
-    return FALSE;
-  }
-
-  if (!gst_video_info_from_caps (&info, caps)) {
-    GST_WARNING_OBJECT (pool, "failed getting video info from caps %"
-        GST_PTR_FORMAT, caps);
-    return FALSE;
-  }
-
-  width = GST_VIDEO_INFO_WIDTH (&info);
-  height = GST_VIDEO_INFO_HEIGHT (&info);
-
-  for (i=0; i < GST_VIDEO_FORMAT_INFO_N_PLANES(info.finfo); i++) {
-    stride[i] = GST_VIDEO_FORMAT_INFO_PSTRIDE(info.finfo, i) *
-                  GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (info.finfo, i, width);
-    size += stride[i] *
-      GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (info.finfo, i, height);
-  }
-
-  gst_buffer_pool_config_set_params (config, caps, size, min_buffers,
-      max_buffers);
-  vspmfltpool->caps = gst_caps_ref (caps);
-
-  return GST_BUFFER_POOL_CLASS (gst_vspmfilter_buffer_pool_parent_class)->set_config
-      (pool, config);
-}
-
 static void
 gst_vspmfilter_buffer_pool_free_buffer (GstBufferPool * bpool, GstBuffer * buffer)
 {
@@ -246,7 +203,6 @@ gst_vspmfilter_buffer_pool_class_init (GstVspmFilterBufferPoolClass * klass)
 
   gobject_class->finalize = gst_vspmfilter_buffer_pool_finalize;
   gstbufferpool_class->alloc_buffer = gst_vspmfilter_buffer_pool_alloc_buffer;
-  gstbufferpool_class->set_config = gst_vspmfilter_buffer_pool_set_config;
   gstbufferpool_class->free_buffer = gst_vspmfilter_buffer_pool_free_buffer;
 }
 
@@ -647,7 +603,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     space->out_port_pool = gst_vspmfilter_buffer_pool_new (space);
 
     structure = gst_buffer_pool_get_config (space->out_port_pool);
-    gst_buffer_pool_config_set_params (structure, outcaps, out_info->size, 5, 5);
+    gst_buffer_pool_config_set_params (structure, outcaps, size, 5, 5);
     if (!gst_buffer_pool_set_config (space->out_port_pool, structure)) {
         GST_WARNING_OBJECT (space, "failed to set buffer pool configuration");
     }
