@@ -705,6 +705,78 @@ format_mismatch:
   }
 }
 
+static gboolean
+gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
+{
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST(trans);
+  gboolean update = FALSE;
+
+  if (space->outbuf_allocate) {
+    GstBufferPool *pool = NULL;
+    GstStructure *config;
+    GstVideoAlignment align;
+    guint i;
+
+    if (gst_query_get_n_allocation_pools (query)) {
+      gst_query_parse_nth_allocation_pool(query, 0, &pool, NULL, NULL, NULL);
+      if (pool) {
+        config = gst_buffer_pool_get_config(pool);
+
+        /* vspmfilter always use its own buffer pool. If downstream requires video
+         * alignment, we consider to update it */
+        if (gst_buffer_pool_has_option(pool,
+                                       GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT)) {
+          /* Get alignment */
+          gst_video_alignment_reset(&align);
+          gst_buffer_pool_config_get_video_alignment(config, &align);
+
+          /* FIXME: Currently, we ignore padding and only check stride */
+          GST_DEBUG_OBJECT(space, "got a stride alignment requirement from "
+                                  "downstream %d:%d:%d:%d",
+                                  align.stride_align[0], align.stride_align[1],
+                                  align.stride_align[2], align.stride_align[3]);
+
+          for (i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+            if ((align.stride_align[i] != 0) &&
+                (space->buf_info.plane_stride[i] % align.stride_align[i] != 0)) {
+              update = TRUE;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (update) {
+      GstStructure *structure;
+      GstCaps *caps = NULL;
+
+      GST_DEBUG_OBJECT(space, "update buffer info and buffer pool");
+
+      if (space->out_port_pool) {
+        if (gst_buffer_pool_is_active (space->out_port_pool)) {
+          gst_buffer_pool_set_active (space->out_port_pool, FALSE);
+        }
+      }
+
+      gst_vspm_filter_set_buffer_info (space, NULL, &align);
+
+      structure = gst_buffer_pool_get_config (space->out_port_pool);
+      gst_buffer_pool_config_get_params(structure, &caps, NULL, NULL, NULL);
+
+      gst_buffer_pool_config_set_params(structure, caps,
+                                        space->buf_info.outbuf_size,
+                                        MIN_BUFFERS, MAX_BUFFERS);
+
+      if (!gst_buffer_pool_set_config (space->out_port_pool, structure)) {
+        GST_WARNING_OBJECT (space, "failed to set buffer pool configuration");
+      }
+    }
+  }
+
+  return TRUE;
+}
+
 static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * trans,
                                           GstBuffer *inbuf, GstBuffer **outbuf)
 {
@@ -862,6 +934,8 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
 
   gstbasetransform_class->prepare_output_buffer = 
       GST_DEBUG_FUNCPTR (gst_vspm_filter_prepare_output_buffer);
+  gstbasetransform_class->decide_allocation =
+      GST_DEBUG_FUNCPTR (gst_vspm_filter_decide_allocation);
   gstvideofilter_class->set_info =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_set_info);
   gstvideofilter_class->transform_frame =
