@@ -566,7 +566,8 @@ gst_vspm_filter_allocate_buffer (GstVspmFilter * space)
               buf_info->plane_size[j] + dmabuf_page_offset[j], page_size);
           res = mmngr_export_start_in_user (&vspm_out->vspm[vspm_used].dmabuf_pid[j],
                                             dmabuf_plane_size_ext[j],
-                                            (unsigned long)phys_addr, &dmabuf_fd[j]);
+                                            (unsigned long) GST_ROUND_DOWN_N(phys_addr, page_size),
+					    &dmabuf_fd[j]);
           if (res != R_MM_OK) {
             GST_ERROR_OBJECT (space,
               "mmngr_export_start_in_user failed (phys_addr:0x%08x)",
