@@ -60,6 +60,10 @@ GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
 #define VSP_FORMAT_PIXEL_BIT	(8)
 #define VSPM_BUFFERS	3
 
+/* isu hardware limitation */
+#define ISU_STRIDE_ALIGN (32)
+#define ISU_ADDR_ALIGN   (512)
+
 GType gst_vspm_filter_get_type (void);
 
 static GQuark _colorspace_quark;
@@ -537,6 +541,23 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
           GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (out_info->finfo, i,
               out_info->width);
 
+      /* Check output stride whether 32 pixels alignment or not */
+      if (stride[i] % ISU_STRIDE_ALIGN)
+        stride[i] = GST_ROUND_UP_32(stride[i]);
+
+      /* Check output address whether 512 bytes alignment or not */
+      if ((stride[i] * out_info->height) % ISU_ADDR_ALIGN) {
+        if (!(out_info->height % 8)) {
+          stride[i] = GST_ROUND_UP_64(stride[i]);
+        } else if (!(out_info->height % 4)) {
+          stride[i] = GST_ROUND_UP_128(stride[i]);
+        } else if (!(out_info->height % 2)) {
+          stride[i] = GST_ROUND_UP_N(stride[i], 256);
+        } else {
+          /* do nothing */
+        }
+      }
+
       plane_size[i] = stride[i] *
         GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (out_info->finfo, i, out_info->height);
 
@@ -903,13 +924,13 @@ gst_vspm_filter_init (GstVspmFilter * space)
   /* mmngr dev open */
   vsp_info->mmngr_fd = open(DEVFILE, O_RDWR);
   if (vsp_info->mmngr_fd == -1) {
-    printf("MMNGR: open error. \n");
+    GST_ERROR ("MMNGR: open error. \n");
   }
   
   if (VSPM_lib_DriverInitialize(&vsp_info->vspm_handle) == R_VSPM_OK) {
     vsp_info->is_init_vspm = TRUE;
   } else {
-    printf("VSPM: Error Initialized. \n");
+    GST_ERROR ("VSPM: Error Initialized. \n");
   }
 
   vspm_in->used = 0;
@@ -982,7 +1003,7 @@ static void cb_func(
   sem_t *p_smpwait = (sem_t *) uwUserData;
 
   if (wResult != 0) {
-    printf("VSPM: error end. (%ld)\n", wResult);
+    GST_ERROR ("VSPM: error end. (%ld)\n", wResult);
   }
   /* Inform frame finish to transform function */
   sem_post (p_smpwait);
@@ -1000,7 +1021,6 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
   p_adr.user_virt_addr = (unsigned long)in_vir;
   ret = ioctl(space->vsp_info->mmngr_fd, MM_IOC_VTOP, &p_adr);
   if (ret) {
-    printf("MMNGR VtoP Convert Error. \n");
     GST_ERROR ("MMNGR VtoP Convert Error. \n");
     return GST_FLOW_ERROR;
   }
@@ -1259,7 +1279,6 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
   ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
   if (ercd) {
-    printf("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     return GST_FLOW_ERROR;
   }
