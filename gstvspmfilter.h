@@ -159,6 +159,20 @@ typedef struct {
   gint current_buffer_index;
 }VspmbufArray ;
 
+typedef struct {
+  guint outbuf_size;
+  guint width;
+  guint height;
+  GstVideoFormat format;
+  guint n_planes;
+  gint  plane_width[GST_VIDEO_MAX_PLANES];
+  gint  plane_height[GST_VIDEO_MAX_PLANES];
+  gint  plane_pixel_stride[GST_VIDEO_MAX_PLANES];
+  gint  plane_stride[GST_VIDEO_MAX_PLANES];
+  gsize plane_offset[GST_VIDEO_MAX_PLANES];
+  gint  plane_size[GST_VIDEO_MAX_PLANES];
+} VspmBufferInfo;
+
 /**
  * GstVspmFilter:
  *
@@ -171,6 +185,7 @@ struct _GstVspmFilter {
   GstAllocator *allocator;
   guint use_dmabuf;
   guint outbuf_allocate;
+  VspmBufferInfo buf_info;
   GstBufferPool *in_port_pool, *out_port_pool;
   Vspm_mmng_ar *vspm_in;
   Vspm_mmng_ar *vspm_out;
