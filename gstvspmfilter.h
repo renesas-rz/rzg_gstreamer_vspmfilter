@@ -59,6 +59,9 @@ G_BEGIN_DECLS
 #define MAX_DEVICES 2
 #define MAX_ENTITIES 4
 
+#define RAW_FORMAT 0x30
+#define YUV_FORMAT 0x20
+
 /* mmngr dev name */
 #define DEVFILE "/dev/rgnmm"
 

@@ -460,7 +460,7 @@ set_colorspace (GstVideoFormat vid_fmt, guint * format, guint * fswap)
       *format = exts[i].isu_format;
 
       /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts[i].isu_swap;
+      *fswap  = exts[i].isu_swap;
       return 0;
     }
   }
@@ -478,7 +478,7 @@ set_colorspace_output (GstVideoFormat vid_fmt, guint * format, guint * fswap)
       *format = exts_out[i].isu_format;
 
       /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts_out[i].isu_swap;
+      *fswap  = exts_out[i].isu_swap;
       return 0;
     }
   }
@@ -1031,6 +1031,36 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   T_ISU_OUT dst_par;
   T_ISU_RS rs_par;
 
+  /* Matrix for converting from YUV to RGB */
+  unsigned int csc_k_matrix_a[3][3] = {{0x04A8, 0x0662, 0x0000},{0x04A8, 0x3CBF, 0x3E70},{0x04A8, 0x0000, 0x0812}};
+  unsigned int csc_offset_a[3][2]   = {{0x10,0x00},{0x80,0x00},{0x80,0x00}};
+  unsigned int csc_clip_a[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
+
+  /* Matrix for converting from RGB to YUV */
+  unsigned int csc_k_matrix_b[3][3] = {{0x0107, 0x0064, 0x0204},{0x3f68, 0x01c2, 0x3ed6},{0x01c2, 0x3fd7, 0x3e87}};
+  unsigned int csc_offset_b[3][2]   = {{0x00,0x10},{0x00,0x80},{0x00,0x80}};
+  unsigned int csc_clip_b[3][2]     = {{0x10,0xEB},{0x10,0xF0},{0x10,0xF0}};
+
+  /* Matrix for converting from RGB to RAW */
+  unsigned int csc_k_matrix_c[3][3] = {{0x0107, 0x0064, 0x0204},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
+  unsigned int csc_offset_c[3][2]   = {{0x00,0x10},{0x00,0x80},{0x00,0x80}};
+  unsigned int csc_clip_c[3][2]     = {{0x10,0xEB},{0x10,0xF0},{0x10,0xF0}};
+
+  /* Matrix for converting from RAW to RGB */
+  unsigned int csc_k_matrix_d[3][3] = {{0x0400, 0x0000, 0x0000},{0x0400, 0x0, 0x0},{0x0400, 0x0, 0x0}};
+  unsigned int csc_offset_d[3][2]   = {{0x00,0x00},{0x00,0x00},{0x00,0x00}};
+  unsigned int csc_clip_d[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
+
+  /* Matrix for converting from RAW to YUV */
+  unsigned int csc_k_matrix_e[3][3] = {{0x0400, 0x0000, 0x0000},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
+  unsigned int csc_offset_e[3][2]   = {{0x00,0x00},{0x00,0x80},{0x00,0x80}};
+  unsigned int csc_clip_e[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
+
+  /* Matrix for converting from YUV to RAW */
+  unsigned int csc_k_matrix_f[3][3] = {{0x04A8, 0x0662, 0x0000},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
+  unsigned int csc_offset_f[3][2]   = {{0x10,0x00},{0x80,0x00},{0x80,0x00}};
+  unsigned int csc_clip_f[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
+
   gint in_width, in_height;
   gint out_width, out_height;
   long ercd;
@@ -1150,7 +1180,50 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     }
     dst_par.format        = vsp_info->out_format;
     dst_par.swap          = vsp_info->out_swapbit;
-    dst_par.csc           = NULL;
+    /* Set csc for color convert */
+    if ((dst_par.format & 0xF0) == (src_par.format & 0xF0)) {
+      dst_par.csc         = NULL;
+    } else {
+      csc_par.csc = ISU_CSC_CUSTOM;
+      if ((src_par.format & RAW_FORMAT) == RAW_FORMAT) {
+        if ((dst_par.format & YUV_FORMAT) == YUV_FORMAT) {
+          /* Convert from RAW to YUV */
+          memcpy(csc_par.k_matrix, csc_k_matrix_e, sizeof(csc_k_matrix_e));
+          memcpy(csc_par.offset  , csc_offset_e  , sizeof(csc_offset_e));
+          memcpy(csc_par.clip    , csc_clip_e    , sizeof(csc_clip_e));
+        } else {
+          /* Convert from RAW to RGB */
+          memcpy(csc_par.k_matrix, csc_k_matrix_d, sizeof(csc_k_matrix_d));
+          memcpy(csc_par.offset  , csc_offset_d  , sizeof(csc_offset_d));
+          memcpy(csc_par.clip    , csc_clip_d    , sizeof(csc_clip_d));
+        }
+      } else if ((src_par.format & YUV_FORMAT) == YUV_FORMAT) {
+        if ((dst_par.format & RAW_FORMAT) == RAW_FORMAT) {
+          /* Convert from YUV to RAW */
+          memcpy(csc_par.k_matrix, csc_k_matrix_f, sizeof(csc_k_matrix_f));
+          memcpy(csc_par.offset  , csc_offset_f  , sizeof(csc_offset_f));
+          memcpy(csc_par.clip    , csc_clip_f    , sizeof(csc_clip_f));
+        } else {
+          /* Convert from YUV to RGB */
+          memcpy(csc_par.k_matrix, csc_k_matrix_a, sizeof(csc_k_matrix_a));
+          memcpy(csc_par.offset  , csc_offset_a  , sizeof(csc_offset_a));
+          memcpy(csc_par.clip    , csc_clip_a    , sizeof(csc_clip_a));
+        }
+      } else { /* src format is RGB */
+        if ((dst_par.format & RAW_FORMAT) == RAW_FORMAT) {
+          /* Convert from RGB to RAW */
+          memcpy(csc_par.k_matrix, csc_k_matrix_c, sizeof(csc_k_matrix_c));
+          memcpy(csc_par.offset  , csc_offset_c  , sizeof(csc_offset_c));
+          memcpy(csc_par.clip    , csc_clip_c    , sizeof(csc_clip_c));
+        } else if ((dst_par.format & YUV_FORMAT) == YUV_FORMAT) {
+          /* Convert from RGB to YUV */
+          memcpy(csc_par.k_matrix, csc_k_matrix_b, sizeof(csc_k_matrix_b));
+          memcpy(csc_par.offset  , csc_offset_b  , sizeof(csc_offset_b));
+          memcpy(csc_par.clip    , csc_clip_b    , sizeof(csc_clip_b));
+        }
+      }
+      dst_par.csc = &csc_par;
+    }
     dst_par.alpha         = &src_alpha_par;
   }
 
