@@ -1160,6 +1160,15 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     return GST_FLOW_ERROR;
   }
 
+  if (!src_addr[0] || !dst_addr[0] ||
+      (in_n_planes >= 2 && !src_addr[1]) ||
+      (out_n_planes >= 2 && !dst_addr[1])) {
+    /* W/A: Sometimes we can not convert virtual address to physical address,
+     * we should skip this frame to avoid issue with HW processor.
+     */
+    return GST_FLOW_OK;
+  }
+
   {
     /* Setting input parameters */
     src_alpha_par.asel    = 0;
