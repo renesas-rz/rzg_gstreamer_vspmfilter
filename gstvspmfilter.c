@@ -419,6 +419,7 @@ struct extensions_t
 /* Note that below swap information will be REVERSED later (in function
  *     set_colorspace) because current system use Little Endian */
 static const struct extensions_t exts[] = {
+  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
   {GST_VIDEO_FORMAT_RGB16,      ISU_RGB565,     ISU_SWAP_B},
   {GST_VIDEO_FORMAT_RGB,        ISU_RGB888,     ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_BGR,        ISU_BGR888,     ISU_SWAP_NO},
@@ -433,11 +434,11 @@ static const struct extensions_t exts[] = {
   {GST_VIDEO_FORMAT_UYVY,       ISU_YUV422_UYVY,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
 };
 
 static const struct extensions_t exts_out[] = {
+  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
   {GST_VIDEO_FORMAT_RGB16,      ISU_RGB565,     ISU_SWAP_B},
   {GST_VIDEO_FORMAT_RGB,        ISU_RGB888,     ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_BGR,        ISU_BGR888,     ISU_SWAP_NO},
@@ -452,7 +453,6 @@ static const struct extensions_t exts_out[] = {
   {GST_VIDEO_FORMAT_UYVY,       ISU_YUV422_UYVY,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
 };
 
