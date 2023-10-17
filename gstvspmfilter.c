@@ -405,58 +405,48 @@ gst_vspm_filter_transform_meta (GstBaseTransform * trans, GstBuffer * outbuf,
 struct extensions_t
 {
   GstVideoFormat gst_format;
-  guint vsp_format;
-  guint vsp_swap;
+  guint isu_format;
+  guint isu_swap;
 };
 
 /* Note that below swap information will be REVERSED later (in function
  *     set_colorspace) because current system use Little Endian */
 static const struct extensions_t exts[] = {
-  {GST_VIDEO_FORMAT_NV12,  VSP_IN_YUV420_SEMI_NV12,  VSP_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
-  {GST_VIDEO_FORMAT_I420,  VSP_IN_YUV420_PLANAR,     VSP_SWAP_NO},    /* I420 is second priority */
-  {GST_VIDEO_FORMAT_YUY2,  VSP_IN_YUV422_INT0_YUY2,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_UYVY,  VSP_IN_YUV422_INT0_UYVY,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBx,  VSP_IN_RGBA8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRx,  VSP_IN_ARGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Not supported in VSP. Use ARGB8888, and swap ARGB -> RABG -> BGRA */
-  {GST_VIDEO_FORMAT_xRGB,  VSP_IN_ARGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_xBGR,  VSP_IN_ABGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBA,  VSP_IN_RGBA8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRA,  VSP_IN_ARGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Same as BGRA */
-  {GST_VIDEO_FORMAT_ARGB,  VSP_IN_ARGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_ABGR,  VSP_IN_ABGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB ,  VSP_IN_RGB888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGR ,  VSP_IN_BGR888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YVYU,  VSP_IN_YUV422_INT0_YVYU,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_Y444,  VSP_IN_YUV444_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV21,  VSP_IN_YUV420_SEMI_NV21,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_v308,  VSP_IN_YUV444_INTERLEAVED,VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB16, VSP_IN_RGB565,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV16,  VSP_IN_YUV422_SEMI_NV16,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV24,  VSP_IN_YUV444_SEMI_PLANAR,VSP_SWAP_NO},
+  {GST_VIDEO_FORMAT_RGB16,      ISU_RGB565,     ISU_SWAP_B},
+  {GST_VIDEO_FORMAT_RGB,        ISU_RGB888,     ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGR,        ISU_BGR888,     ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_RGBx,       ISU_RGBA8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGRx,       ISU_ARGB8888,   ISU_SWAP_B | ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_xRGB,       ISU_ARGB8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_xBGR,       ISU_ABGR8888,   ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_RGBA,       ISU_RGBA8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGRA,       ISU_ARGB8888,   ISU_SWAP_B | ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_ARGB,       ISU_ARGB8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_ABGR,       ISU_ABGR8888,   ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_UYVY,       ISU_YUV422_UYVY,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
 };
 
 static const struct extensions_t exts_out[] = {
-  {GST_VIDEO_FORMAT_NV12,  VSP_OUT_YUV420_SEMI_NV12,  VSP_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
-  {GST_VIDEO_FORMAT_I420,  VSP_OUT_YUV420_PLANAR,     VSP_SWAP_NO},    /* I420 is second priority */
-  {GST_VIDEO_FORMAT_YUY2,  VSP_OUT_YUV422_INT0_YUY2,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_UYVY,  VSP_OUT_YUV422_INT0_UYVY,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBx,  VSP_OUT_RGBP8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRx,  VSP_OUT_PRGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Not supported in VSP. Use ARGB8888, and swap ARGB -> RABG -> BGRA */
-  {GST_VIDEO_FORMAT_xRGB,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_xBGR,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBA,  VSP_OUT_RGBP8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRA,  VSP_OUT_PRGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Same as BGRA */
-  {GST_VIDEO_FORMAT_ARGB,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_ABGR,  VSP_OUT_PBGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB ,  VSP_OUT_RGB888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGR ,  VSP_OUT_BGR888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YVYU,  VSP_OUT_YUV422_INT0_YVYU,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_Y444,  VSP_OUT_YUV444_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV21,  VSP_OUT_YUV420_SEMI_NV21,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_v308,  VSP_OUT_YUV444_INTERLEAVED,VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB16, VSP_OUT_RGB565,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV16,  VSP_OUT_YUV422_SEMI_NV16,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV24,  VSP_OUT_YUV444_SEMI_PLANAR,VSP_SWAP_NO},
+  {GST_VIDEO_FORMAT_RGB16,      ISU_RGB565,     ISU_SWAP_B},
+  {GST_VIDEO_FORMAT_RGB,        ISU_RGB888,     ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGR,        ISU_BGR888,     ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_RGBx,       ISU_RGBA8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGRx,       ISU_ARGB8888,   ISU_SWAP_B | ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_xRGB,       ISU_ARGB8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_xBGR,       ISU_ABGR8888,   ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_RGBA,       ISU_RGBA8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_BGRA,       ISU_ARGB8888,   ISU_SWAP_B | ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_ARGB,       ISU_ARGB8888,   ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_ABGR,       ISU_ABGR8888,   ISU_SWAP_W},
+  {GST_VIDEO_FORMAT_UYVY,       ISU_YUV422_UYVY,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_NV12,       ISU_YUV420_NV12,ISU_SWAP_NO},
+  {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
 };
 
 static gint
@@ -467,10 +457,10 @@ set_colorspace (GstVideoFormat vid_fmt, guint * format, guint * fswap)
 
   for (i = 0; i < nr_exts; i++) {
     if (vid_fmt == exts[i].gst_format) {
-      *format = exts[i].vsp_format;
+      *format = exts[i].isu_format;
 
       /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts[i].vsp_swap;
+      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts[i].isu_swap;
       return 0;
     }
   }
@@ -485,10 +475,10 @@ set_colorspace_output (GstVideoFormat vid_fmt, guint * format, guint * fswap)
 
   for (i = 0; i < nr_exts; i++) {
     if (vid_fmt == exts_out[i].gst_format) {
-      *format = exts_out[i].vsp_format;
+      *format = exts_out[i].isu_format;
 
       /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts_out[i].vsp_swap;
+      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts_out[i].isu_swap;
       return 0;
     }
   }
@@ -999,17 +989,15 @@ static void cb_func(
 }
 
 static GstFlowReturn
-find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
-    gpointer *out_phy1, gpointer *out_phy2)
+find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
 {
-  struct MM_PARAM p_adr[2];
+  struct MM_PARAM p_adr;
   GstFlowReturn ret;
   gint page_size, max_size_in_page;
 
   /* change virtual address to physical address */
   memset(&p_adr, 0, sizeof(p_adr));
-  p_adr[0].user_virt_addr = (unsigned long)in_vir1;
-  p_adr[1].user_virt_addr = (unsigned long)in_vir2;
+  p_adr.user_virt_addr = (unsigned long)in_vir;
   ret = ioctl(space->vsp_info->mmngr_fd, MM_IOC_VTOP, &p_adr);
   if (ret) {
     printf("MMNGR VtoP Convert Error. \n");
@@ -1020,13 +1008,10 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
    * start of page. If there is an offset from page, we need to add it here */
   page_size = getpagesize ();
   max_size_in_page = page_size - 1;
-  if ((p_adr[0].hard_addr & max_size_in_page) == 0)
-    p_adr[0].hard_addr += (max_size_in_page & (unsigned long)in_vir1);
-  if ((p_adr[1].hard_addr & max_size_in_page) == 0)
-    p_adr[1].hard_addr += (max_size_in_page & (unsigned long)in_vir2);
+  if ((p_adr.hard_addr & max_size_in_page) == 0)
+    p_adr.hard_addr += (max_size_in_page & (unsigned long)in_vir);
 
-  if (out_phy1 != NULL) *out_phy1 = (gpointer) p_adr[0].hard_addr;
-  if (out_phy2 != NULL) *out_phy2 = (gpointer) p_adr[1].hard_addr;
+  if (out_phy != NULL) *out_phy = (gpointer) p_adr.hard_addr;
   return GST_FLOW_OK;
 }
 
@@ -1038,18 +1023,18 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   GstVspmFilterVspInfo *vsp_info;
 
   VSPM_IP_PAR vspm_ip;
-  VSPM_VSP_PAR vsp_par;
+  VSPM_ISU_PAR isu_par;
 
-  T_VSP_IN src_par;
-  T_VSP_ALPHA src_alpha_par;
-  T_VSP_OUT dst_par;
-  T_VSP_CTRL ctrl_par;
-  T_VSP_UDS uds_par;
+  T_ISU_IN src_par;
+  T_ISU_ALPHA src_alpha_par, dst_alpha_par;
+  T_ISU_CSC csc_par;
+  T_ISU_OUT dst_par;
+  T_ISU_RS rs_par;
+
   gint in_width, in_height;
   gint out_width, out_height;
   long ercd;
   gint irc;
-  unsigned long use_module;
 
   int i;
   GstFlowReturn ret;
@@ -1078,18 +1063,16 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   vsp_info->out_width = GST_VIDEO_FRAME_COMP_WIDTH (out_frame, 0);
   vsp_info->out_height = GST_VIDEO_FRAME_COMP_HEIGHT (out_frame, 0);
 
-  memset(&ctrl_par, 0, sizeof(T_VSP_CTRL));
-
   if (vsp_info->format_flag == 0) {
     irc = set_colorspace (GST_VIDEO_FRAME_FORMAT (in_frame), &vsp_info->in_format, &vsp_info->in_swapbit);
     if (irc != 0) {
-      printf("input format is non-support.\n");
+      GST_ERROR("input format is non-support.\n");
       return GST_FLOW_ERROR;
     }
 
     irc = set_colorspace_output (GST_VIDEO_FRAME_FORMAT (out_frame), &vsp_info->out_format, &vsp_info->out_swapbit);
     if (irc != 0) {
-      printf("output format is non-support.\n");
+      GST_ERROR("output format is non-support.\n");
       return GST_FLOW_ERROR;
     }
     vsp_info->format_flag = 1;
@@ -1106,147 +1089,81 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   in_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_in_vinfo);
   out_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_out_vinfo);
 
-  if ((in_width == out_width) && (in_height == out_height)) {
-    use_module = 0;
-  } else {
-    /* UDS scaling */
-    use_module = VSP_UDS_USE;
-  }
-
-  ret = find_physical_address (space, in_frame->data[0], out_frame->data[0],
-      &src_addr[0], &dst_addr[0]);
+  ret = find_physical_address (space, in_frame->data[0],  &src_addr[0]);
   if (ret != GST_FLOW_OK) return ret;
 
-  if (in_n_planes >= 2 || out_n_planes >= 2) {
-    ret = find_physical_address (space, in_frame->data[1], out_frame->data[1],
-        &src_addr[1], &dst_addr[1]);
+  ret = find_physical_address (space, out_frame->data[0],  &dst_addr[0]);
+  if (ret != GST_FLOW_OK) return ret;
+
+  if (in_n_planes >= 2) {
+    ret = find_physical_address (space, in_frame->data[1],  &src_addr[1]);
     if (ret != GST_FLOW_OK) return ret;
   }
-  if (in_n_planes >= 3 || out_n_planes >= 3) {
-    ret = find_physical_address (space, in_frame->data[2], out_frame->data[2],
-        &src_addr[2], &dst_addr[2]);
+
+  if (out_n_planes >= 2) {
+    ret = find_physical_address (space, out_frame->data[1],  &dst_addr[1]);
     if (ret != GST_FLOW_OK) return ret;
+  }
+
+  if (in_n_planes >= 3 || out_n_planes >= 3) {
+    GST_ERROR("ISU hardware does not support number plane > 2\n");
+    return GST_FLOW_ERROR;
   }
 
   {
     /* Setting input parameters */
-    src_alpha_par.addr_a  = NULL;
-    src_alpha_par.alphan  = VSP_ALPHA_NO;
-    src_alpha_par.alpha1  = 0;
-    src_alpha_par.alpha2  = 0;
-    src_alpha_par.astride = 0;
-    src_alpha_par.aswap   = VSP_SWAP_NO;
-    src_alpha_par.asel    = VSP_ALPHA_NUM5;
-    src_alpha_par.aext    = VSP_AEXT_EXPAN;
+    src_alpha_par.asel    = 0;
     src_alpha_par.anum0   = 0;
     src_alpha_par.anum1   = 0;
-    src_alpha_par.afix    = 0xff;
-    src_alpha_par.irop    = VSP_IROP_NOP;
-    src_alpha_par.msken   = VSP_MSKEN_ALPHA;
-    src_alpha_par.bsel    = 0;
-    src_alpha_par.mgcolor = 0;
-    src_alpha_par.mscolor0  = 0;
-    src_alpha_par.mscolor1  = 0;
+    src_alpha_par.anum2   = 0;
+    src_alpha_par.athres0 = 0;
+    src_alpha_par.athres1 = 0;
 
-    src_par.addr        = src_addr[0];
-    src_par.addr_c0     = src_addr[1];
-    src_par.addr_c1     = src_addr[2];
-    src_par.stride      = in_frame->info.stride[0];
-    src_par.stride_c    = in_frame->info.stride[1];
-
-    src_par.csc         = VSP_CSC_OFF;  /* do not convert colorspace */
-    src_par.width       = in_width;
-    src_par.height      = in_height;
-    src_par.width_ex    = 0;
-    src_par.height_ex   = 0;
-    src_par.x_offset    = 0;
-    src_par.y_offset    = 0;
-    src_par.format      = vsp_info->in_format;
-    src_par.swap        = vsp_info->in_swapbit;
-    src_par.x_position  = 0;
-    src_par.y_position  = 0;
-    src_par.pwd         = VSP_LAYER_PARENT;
-    src_par.cipm        = VSP_CIPM_0_HOLD;
-    src_par.cext        = VSP_CEXT_EXPAN;
-    src_par.iturbt      = VSP_ITURBT_709;
-    src_par.clrcng      = VSP_ITU_COLOR;
-    src_par.vir         = VSP_NO_VIR;
-    src_par.vircolor    = 0x00000000;
-    src_par.osd_lut     = NULL;
-    src_par.alpha_blend = &src_alpha_par;
-    src_par.clrcnv      = NULL;
-    src_par.connect     = use_module;
+    src_par.addr          = src_addr[0];
+    src_par.stride        = in_frame->info.stride[0];
+    if (in_n_planes >= 2) {
+      src_par.addr_c      = src_addr[1];
+      src_par.stride_c    = in_frame->info.stride[1];
+    } else {
+      src_par.addr_c      = 0;
+      src_par.stride_c    = 0;
+    }
+    src_par.width         = in_width;
+    src_par.height        = in_height;
+    src_par.format        = vsp_info->in_format;
+    src_par.swap          = vsp_info->in_swapbit;
+    src_par.td            = NULL;
+    src_par.alpha         = &src_alpha_par;
+    src_par.uv_conv       = 0;
   }
 
   {
     /* Setting output parameters */
-    dst_par.addr      = dst_addr[0];
-    dst_par.addr_c0   = dst_addr[1];
-    dst_par.addr_c1   = dst_addr[2];
-    dst_par.stride    = out_frame->info.stride[0];
-    dst_par.stride_c  = out_frame->info.stride[1];
-
-    /* convert if format in and out different in color space */
-    if (!GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_in_vinfo) != !GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_out_vinfo))
-      dst_par.csc     = VSP_CSC_ON;
-    else dst_par.csc  = VSP_CSC_OFF;
-
-    dst_par.width     = out_width;
-    dst_par.height    = out_height;
-    dst_par.x_offset  = 0;
-    dst_par.y_offset  = 0;
-    dst_par.format    = vsp_info->out_format;
-    dst_par.pxa       = VSP_PAD_P;
-    dst_par.pad       = 0xff;
-    dst_par.x_coffset = 0;
-    dst_par.y_coffset = 0;
-    dst_par.iturbt    = VSP_ITURBT_709;
-    dst_par.clrcng    = VSP_ITU_COLOR;
-    dst_par.cbrm      = VSP_CSC_ROUND_DOWN;
-    dst_par.abrm      = VSP_CONVERSION_ROUNDDOWN;
-    dst_par.athres    = 0;
-    dst_par.clmd      = VSP_CLMD_NO;
-    dst_par.dith      = VSP_NO_DITHER;
-    dst_par.swap      = vsp_info->out_swapbit;
+    dst_par.addr          = dst_addr[0];
+    dst_par.stride        = out_frame->info.stride[0];
+    if (out_n_planes >= 2) {
+      dst_par.addr_c      = dst_addr[1];
+      dst_par.stride_c    = out_frame->info.stride[1];
+    } else {
+      dst_par.addr_c      = 0;
+      dst_par.stride_c    = 0;
+    }
+    dst_par.format        = vsp_info->out_format;
+    dst_par.swap          = vsp_info->out_swapbit;
+    dst_par.csc           = NULL;
+    dst_par.alpha         = &src_alpha_par;
   }
 
-  if (use_module == VSP_UDS_USE) {
-    /* Set T_VSP_UDS. */
-    ctrl_par.uds     = &uds_par;
-    memset(&uds_par, 0, sizeof(T_VSP_UDS));
-    uds_par.fmd      = VSP_FMD_NO;
-    uds_par.filcolor = 0x0000FF00; /* green */
-	uds_par.amd      = VSP_AMD;
-
-	uds_par.clip		= VSP_CLIP_OFF;
-	uds_par.alpha		= VSP_ALPHA_ON;
-	uds_par.complement	= VSP_COMPLEMENT_BIL;
-	uds_par.athres0		= 0;
-	uds_par.athres1		= 0;
-	uds_par.anum0		= 0;
-	uds_par.anum1		= 0;
-	uds_par.anum2	= 0;
-
-    uds_par.x_ratio     = (unsigned short)( (in_width << 12) / out_width );
-    uds_par.y_ratio     = (unsigned short)( (in_height << 12) / out_height );
-    uds_par.out_cwidth  = (unsigned short)out_width;
-    uds_par.out_cheight = (unsigned short)out_height;
-    uds_par.connect     = 0;
+  {
+    /* Update all settings */
+    isu_par.src_par       = &src_par;
+    isu_par.dst_par       = &dst_par;
+    isu_par.rs_par        = NULL;
   }
-
-
-  vsp_par.rpf_num   = 1;
-  vsp_par.use_module  = use_module;
-  vsp_par.src1_par  = &src_par;
-  vsp_par.src2_par  = NULL;
-  vsp_par.src3_par  = NULL;
-  vsp_par.src4_par  = NULL;
-  vsp_par.dst_par   = &dst_par;
-  vsp_par.ctrl_par  = &ctrl_par;
 
   memset(&vspm_ip, 0, sizeof(VSPM_IP_PAR));
-  vspm_ip.uhType    = VSPM_TYPE_VSP_AUTO;
-  vspm_ip.unionIpParam.ptVsp = &vsp_par;
+  vspm_ip.uhType             = VSPM_TYPE_ISU_AUTO;
+  vspm_ip.unionIpParam.ptisu = &isu_par;
 
   ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
   if (ercd) {
