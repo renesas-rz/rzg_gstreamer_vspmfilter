@@ -90,6 +90,9 @@ static GstFlowReturn gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
 static void gst_vspm_filter_finalize (GObject * obj);
 
+static void gst_vspm_filter_import_fd (GstMemory *mem, gpointer *out, GQueue *import_list);
+static void gst_vspm_filter_release_fd (GQueue *import_list);
+
 struct _GstBaseTransformPrivate
 {
   /* Set by sub-class */
@@ -723,6 +726,8 @@ gst_vspmfilter_change_state (GstElement * element, GstStateChange transition)
         gst_object_unref (space->out_port_pool);
         space->out_port_pool = NULL;
       }
+      /* Release the importing to avoid leak FD */
+      gst_vspm_filter_release_fd (space->mmngr_import_list);
       break;
     default:
       break;
@@ -858,6 +863,11 @@ gst_vspm_filter_finalize (GObject * obj)
         mmngr_import_end_in_user(vspm_in->vspm[i].dmabuf_pid[j]);
   }
 
+  /* Release the importing to avoid leak FD */
+  gst_vspm_filter_release_fd (space->mmngr_import_list);
+
+  g_queue_free (space->mmngr_import_list);
+
   while (vspm_out->used)
   {
     int i = vspm_out->used - 1;
@@ -941,6 +951,7 @@ gst_vspm_filter_init (GstVspmFilter * space)
   space->outbuf_allocate = FALSE;
   space->use_dmabuf = FALSE;
   space->first_buff = 1;
+  space->mmngr_import_list = g_queue_new ();
 
   for (i = 0; i < sizeof(vspm_in->vspm)/sizeof(vspm_in->vspm[0]); i++) {
     for (j = 0; j < GST_VIDEO_MAX_PLANES; j++)
@@ -1035,6 +1046,35 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
   return GST_FLOW_OK;
 }
 
+static void
+gst_vspm_filter_import_fd (GstMemory *mem, gpointer *out, GQueue *import_list)
+{
+  int fd;
+
+  if (gst_is_dmabuf_memory(mem)) {
+    int import_pid;
+    size_t size;
+
+    fd = gst_dmabuf_memory_get_fd (mem);
+    if (R_MM_OK == mmngr_import_start_in_user_ext (&import_pid,
+                                                   &size, (unsigned int *)out,
+                                                   fd, NULL)) {
+      g_queue_push_tail (import_list, GINT_TO_POINTER(import_pid));
+    }
+  }
+}
+
+static void
+gst_vspm_filter_release_fd (GQueue *import_list)
+{
+  int fd;
+  while (!g_queue_is_empty(import_list)) {
+    fd = GPOINTER_TO_INT(g_queue_pop_tail (import_list));
+    if (fd >= 0 )
+      mmngr_import_end_in_user_ext (fd);
+  }
+}
+
 static GstFlowReturn
 gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame)
@@ -1096,6 +1136,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   void *src_addr[3] = { 0 };
   void *dst_addr[3] = { 0 };
   guint in_n_planes, out_n_planes;
+  GstBuffer *buf;
+  GstMemory *mem;
 
   space = GST_VIDEO_CONVERT_CAST (filter);
   vsp_info = space->vsp_info;
@@ -1117,13 +1159,15 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     irc = set_colorspace (GST_VIDEO_FRAME_FORMAT (in_frame), &vsp_info->in_format, &vsp_info->in_swapbit);
     if (irc != 0) {
       GST_ERROR("input format is non-support.\n");
-      return GST_FLOW_ERROR;
+      ret = GST_FLOW_ERROR;
+      goto err;
     }
 
     irc = set_colorspace_output (GST_VIDEO_FRAME_FORMAT (out_frame), &vsp_info->out_format, &vsp_info->out_swapbit);
     if (irc != 0) {
       GST_ERROR("output format is non-support.\n");
-      return GST_FLOW_ERROR;
+      ret = GST_FLOW_ERROR;
+      goto err;
     }
     vsp_info->format_flag = 1;
   }
@@ -1140,24 +1184,57 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   out_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_out_vinfo);
 
   ret = find_physical_address (space, in_frame->data[0],  &src_addr[0]);
-  if (ret != GST_FLOW_OK) return ret;
+  if (!src_addr[0] || ret) {
+    buf = in_frame->buffer;
+    mem = gst_buffer_peek_memory (buf, 0);
+    gst_vspm_filter_import_fd (mem, &src_addr[0], space->mmngr_import_list);
+  }
 
   ret = find_physical_address (space, out_frame->data[0],  &dst_addr[0]);
-  if (ret != GST_FLOW_OK) return ret;
+  if (!dst_addr[0] || ret) {
+    buf = out_frame->buffer;
+    mem = gst_buffer_peek_memory (buf, 0);
+    gst_vspm_filter_import_fd (mem, &dst_addr[0], space->mmngr_import_list);
+  }
 
   if (in_n_planes >= 2) {
     ret = find_physical_address (space, in_frame->data[1],  &src_addr[1]);
-    if (ret != GST_FLOW_OK) return ret;
+    if (!src_addr[1] || ret) {
+      buf = in_frame->buffer;
+      if (gst_buffer_n_memory(buf) > 1) {
+        /* Make sure we have separate GstMemory for each planar */
+        mem = gst_buffer_peek_memory (buf, 1);
+        gst_vspm_filter_import_fd (mem, &src_addr[1], space->mmngr_import_list);
+      } else {
+        /* We can not find the exactly address for plane 2, return as error */
+        GST_ERROR("Can not find physical address of input buffer for planar 2\n");
+        ret = GST_FLOW_ERROR;
+        goto err;
+      }
+    }
   }
 
   if (out_n_planes >= 2) {
     ret = find_physical_address (space, out_frame->data[1],  &dst_addr[1]);
-    if (ret != GST_FLOW_OK) return ret;
+    if (!dst_addr[1] || ret) {
+      buf = out_frame->buffer;
+      if (gst_buffer_n_memory(buf) > 1) {
+        /* Make sure we have separate GstMemory for each planar */
+        mem = gst_buffer_peek_memory (buf, 1);
+        gst_vspm_filter_import_fd (mem, &dst_addr[1], space->mmngr_import_list);
+      } else {
+        GST_ERROR("Can not find physical address of output buffer for planar 2\n");
+        /* We can not find the exactly address for plane 2, return as error */
+        ret = GST_FLOW_ERROR;
+        goto err;
+      }
+    }
   }
 
   if (in_n_planes >= 3 || out_n_planes >= 3) {
     GST_ERROR("ISU hardware does not support number plane > 2\n");
-    return GST_FLOW_ERROR;
+    ret = GST_FLOW_ERROR;
+    goto err;
   }
 
   if (!src_addr[0] || !dst_addr[0] ||
@@ -1166,7 +1243,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     /* W/A: Sometimes we can not convert virtual address to physical address,
      * we should skip this frame to avoid issue with HW processor.
      */
-    return GST_FLOW_OK;
+    ret = GST_FLOW_OK;
+    goto err;
   }
 
   {
@@ -1271,7 +1349,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     rs_par.y_ratio        = (unsigned short)( (in_height << 12) / out_height );
     if (!(rs_par.x_ratio & 0x0000F000) || !(rs_par.y_ratio & 0x0000F000)) {
       GST_ERROR("ISU driver does not support scale up\n");
-      return GST_FLOW_ERROR;
+      ret = GST_FLOW_ERROR;
+      goto err;
     }
   }
 
@@ -1289,13 +1368,19 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
   if (ercd) {
     GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
-    return GST_FLOW_ERROR;
+    ret = GST_FLOW_ERROR;
+    goto err;
   }
 
   /* Wait for callback */
   sem_wait (&space->smp_wait);
 
-  return GST_FLOW_OK;
+  ret = GST_FLOW_OK;
+err:
+  /* Release the importing to avoid leak FD */
+  gst_vspm_filter_release_fd (space->mmngr_import_list);
+
+  return ret;
 }
 
 static gboolean

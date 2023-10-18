@@ -175,6 +175,7 @@ struct _GstVspmFilter {
   Vspm_mmng_ar *vspm_in;
   Vspm_mmng_ar *vspm_out;
   VspmbufArray *vspm_outbuf;
+  GQueue *mmngr_import_list;
   gint first_buff;
   sem_t smp_wait;
 };
