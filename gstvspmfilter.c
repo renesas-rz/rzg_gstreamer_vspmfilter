@@ -1155,10 +1155,29 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   }
 
   {
+    /* Setting resize parameters */
+    memset(&rs_par, 0, sizeof(T_ISU_RS));
+    rs_par.start_x        = 0;
+    rs_par.start_y        = 0;
+    rs_par.tune_x         = 0;
+    rs_par.tune_y         = 0;
+    rs_par.crop_w         = out_width;
+    rs_par.crop_h         = out_height;
+    rs_par.pad_mode       = 0;
+    rs_par.pad_val        = 0;
+    rs_par.x_ratio        = (unsigned short)( (in_width << 12) / out_width );
+    rs_par.y_ratio        = (unsigned short)( (in_height << 12) / out_height );
+    if (!(rs_par.x_ratio & 0x0000F000) || !(rs_par.y_ratio & 0x0000F000)) {
+      GST_ERROR("ISU driver does not support scale up\n");
+      return GST_FLOW_ERROR;
+    }
+  }
+
+  {
     /* Update all settings */
     isu_par.src_par       = &src_par;
     isu_par.dst_par       = &dst_par;
-    isu_par.rs_par        = NULL;
+    isu_par.rs_par        = &rs_par;
   }
 
   memset(&vspm_ip, 0, sizeof(VSPM_IP_PAR));
