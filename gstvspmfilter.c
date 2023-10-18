@@ -1122,10 +1122,20 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
         &src_addr[1], &dst_addr[1]);
     if (ret != GST_FLOW_OK) return ret;
   }
+
   if (in_n_planes >= 3 || out_n_planes >= 3) {
     ret = find_physical_address (space, in_frame->data[2], out_frame->data[2],
         &src_addr[2], &dst_addr[2]);
     if (ret != GST_FLOW_OK) return ret;
+  }
+
+  if (!src_addr[0] || !dst_addr[0] ||
+      ((in_n_planes >= 2 && !src_addr[1]) || (out_n_planes >= 2 && !dst_addr[1])) ||
+      ((in_n_planes >= 3 && !src_addr[2]) || (out_n_planes >= 3 && !dst_addr[2]))) {
+    /* W/A: Sometimes we can not convert virtual address to physical address,
+     * we should skip this frame to avoid issue with HW processor.
+     */
+    return GST_FLOW_OK;
   }
 
   {
