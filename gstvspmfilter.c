@@ -913,13 +913,13 @@ gst_vspm_filter_init (GstVspmFilter * space)
   /* mmngr dev open */
   vsp_info->mmngr_fd = open(DEVFILE, O_RDWR);
   if (vsp_info->mmngr_fd == -1) {
-    printf("MMNGR: open error. \n");
+    GST_ERROR ("MMNGR: open error. \n");
   }
   
   if (VSPM_lib_DriverInitialize(&vsp_info->vspm_handle) == R_VSPM_OK) {
     vsp_info->is_init_vspm = TRUE;
   } else {
-    printf("VSPM: Error Initialized. \n");
+    GST_ERROR ("VSPM: Error Initialized. \n");
   }
 
   vspm_in->used = 0;
@@ -992,7 +992,7 @@ static void cb_func(
   sem_t *p_smpwait = (sem_t *) uwUserData;
 
   if (wResult != 0) {
-    printf("VSPM: error end. (%ld)\n", wResult);
+    GST_ERROR ("VSPM: error end. (%ld)\n", wResult);
   }
   /* Inform frame finish to transform function */
   sem_post (p_smpwait);
@@ -1012,7 +1012,6 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
   p_adr[1].user_virt_addr = (unsigned long)in_vir2;
   ret = ioctl(space->vsp_info->mmngr_fd, MM_IOC_VTOP, &p_adr);
   if (ret) {
-    printf("MMNGR VtoP Convert Error. \n");
     GST_ERROR ("MMNGR VtoP Convert Error. \n");
     return GST_FLOW_ERROR;
   }
@@ -1045,6 +1044,7 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   T_VSP_OUT dst_par;
   T_VSP_CTRL ctrl_par;
   T_VSP_UDS uds_par;
+
   gint in_width, in_height;
   gint out_width, out_height;
   long ercd;
@@ -1083,13 +1083,13 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   if (vsp_info->format_flag == 0) {
     irc = set_colorspace (GST_VIDEO_FRAME_FORMAT (in_frame), &vsp_info->in_format, &vsp_info->in_swapbit);
     if (irc != 0) {
-      printf("input format is non-support.\n");
+      GST_ERROR("input format is non-support.\n");
       return GST_FLOW_ERROR;
     }
 
     irc = set_colorspace_output (GST_VIDEO_FRAME_FORMAT (out_frame), &vsp_info->out_format, &vsp_info->out_swapbit);
     if (irc != 0) {
-      printf("output format is non-support.\n");
+      GST_ERROR("output format is non-support.\n");
       return GST_FLOW_ERROR;
     }
     vsp_info->format_flag = 1;
@@ -1130,127 +1130,131 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
   {
     /* Setting input parameters */
-    src_alpha_par.addr_a  = NULL;
-    src_alpha_par.alphan  = VSP_ALPHA_NO;
-    src_alpha_par.alpha1  = 0;
-    src_alpha_par.alpha2  = 0;
-    src_alpha_par.astride = 0;
-    src_alpha_par.aswap   = VSP_SWAP_NO;
-    src_alpha_par.asel    = VSP_ALPHA_NUM5;
-    src_alpha_par.aext    = VSP_AEXT_EXPAN;
-    src_alpha_par.anum0   = 0;
-    src_alpha_par.anum1   = 0;
-    src_alpha_par.afix    = 0xff;
-    src_alpha_par.irop    = VSP_IROP_NOP;
-    src_alpha_par.msken   = VSP_MSKEN_ALPHA;
-    src_alpha_par.bsel    = 0;
-    src_alpha_par.mgcolor = 0;
-    src_alpha_par.mscolor0  = 0;
-    src_alpha_par.mscolor1  = 0;
+    src_alpha_par.addr_a   = NULL;
+    src_alpha_par.alphan   = VSP_ALPHA_NO;
+    src_alpha_par.alpha1   = 0;
+    src_alpha_par.alpha2   = 0;
+    src_alpha_par.astride  = 0;
+    src_alpha_par.aswap    = VSP_SWAP_NO;
+    src_alpha_par.asel     = VSP_ALPHA_NUM5;
+    src_alpha_par.aext     = VSP_AEXT_EXPAN;
+    src_alpha_par.anum0    = 0;
+    src_alpha_par.anum1    = 0;
+    src_alpha_par.afix     = 0xff;
+    src_alpha_par.irop     = VSP_IROP_NOP;
+    src_alpha_par.msken    = VSP_MSKEN_ALPHA;
+    src_alpha_par.bsel     = 0;
+    src_alpha_par.mgcolor  = 0;
+    src_alpha_par.mscolor0 = 0;
+    src_alpha_par.mscolor1 = 0;
 
-    src_par.addr        = src_addr[0];
-    src_par.addr_c0     = src_addr[1];
-    src_par.addr_c1     = src_addr[2];
-    src_par.stride      = in_frame->info.stride[0];
-    src_par.stride_c    = in_frame->info.stride[1];
-
-    src_par.csc         = VSP_CSC_OFF;  /* do not convert colorspace */
-    src_par.width       = in_width;
-    src_par.height      = in_height;
-    src_par.width_ex    = 0;
-    src_par.height_ex   = 0;
-    src_par.x_offset    = 0;
-    src_par.y_offset    = 0;
-    src_par.format      = vsp_info->in_format;
-    src_par.swap        = vsp_info->in_swapbit;
-    src_par.x_position  = 0;
-    src_par.y_position  = 0;
-    src_par.pwd         = VSP_LAYER_PARENT;
-    src_par.cipm        = VSP_CIPM_0_HOLD;
-    src_par.cext        = VSP_CEXT_EXPAN;
-    src_par.iturbt      = VSP_ITURBT_709;
-    src_par.clrcng      = VSP_ITU_COLOR;
-    src_par.vir         = VSP_NO_VIR;
-    src_par.vircolor    = 0x00000000;
-    src_par.osd_lut     = NULL;
-    src_par.alpha_blend = &src_alpha_par;
-    src_par.clrcnv      = NULL;
-    src_par.connect     = use_module;
+    src_par.addr           = src_addr[0];
+    src_par.addr_c0        = src_addr[1];
+    src_par.addr_c1        = src_addr[2];
+    src_par.stride         = in_frame->info.stride[0];
+    src_par.stride_c       = in_frame->info.stride[1];
+    src_par.csc            = VSP_CSC_OFF;  /* do not convert colorspace */
+    src_par.width          = in_width;
+    src_par.height         = in_height;
+    src_par.width_ex       = 0;
+    src_par.height_ex      = 0;
+    src_par.x_offset       = 0;
+    src_par.y_offset       = 0;
+    src_par.format         = vsp_info->in_format;
+    src_par.swap           = vsp_info->in_swapbit;
+    src_par.x_position     = 0;
+    src_par.y_position     = 0;
+    src_par.pwd            = VSP_LAYER_PARENT;
+    src_par.cipm           = VSP_CIPM_0_HOLD;
+    src_par.cext           = VSP_CEXT_EXPAN;
+    src_par.iturbt         = VSP_ITURBT_709;
+    src_par.clrcng         = VSP_ITU_COLOR;
+    src_par.vir            = VSP_NO_VIR;
+    src_par.vircolor       = 0x00000000;
+    src_par.osd_lut        = NULL;
+    src_par.alpha_blend    = &src_alpha_par;
+    src_par.clrcnv         = NULL;
+    src_par.connect        = use_module;
   }
 
   {
     /* Setting output parameters */
-    dst_par.addr      = dst_addr[0];
-    dst_par.addr_c0   = dst_addr[1];
-    dst_par.addr_c1   = dst_addr[2];
-    dst_par.stride    = out_frame->info.stride[0];
-    dst_par.stride_c  = out_frame->info.stride[1];
+    dst_par.addr           = dst_addr[0];
+    dst_par.addr_c0        = dst_addr[1];
+    dst_par.addr_c1        = dst_addr[2];
+    dst_par.stride         = out_frame->info.stride[0];
+    dst_par.stride_c       = out_frame->info.stride[1];
 
     /* convert if format in and out different in color space */
-    if (!GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_in_vinfo) != !GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_out_vinfo))
-      dst_par.csc     = VSP_CSC_ON;
-    else dst_par.csc  = VSP_CSC_OFF;
+    if (!GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_in_vinfo) != !GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_out_vinfo)) {
+      dst_par.csc          = VSP_CSC_ON;
+    } else {
+      dst_par.csc          = VSP_CSC_OFF;
+    }
 
-    dst_par.width     = out_width;
-    dst_par.height    = out_height;
-    dst_par.x_offset  = 0;
-    dst_par.y_offset  = 0;
-    dst_par.format    = vsp_info->out_format;
-    dst_par.pxa       = VSP_PAD_P;
-    dst_par.pad       = 0xff;
-    dst_par.x_coffset = 0;
-    dst_par.y_coffset = 0;
-    dst_par.iturbt    = VSP_ITURBT_709;
-    dst_par.clrcng    = VSP_ITU_COLOR;
-    dst_par.cbrm      = VSP_CSC_ROUND_DOWN;
-    dst_par.abrm      = VSP_CONVERSION_ROUNDDOWN;
-    dst_par.athres    = 0;
-    dst_par.clmd      = VSP_CLMD_NO;
-    dst_par.dith      = VSP_NO_DITHER;
-    dst_par.swap      = vsp_info->out_swapbit;
+    dst_par.width          = out_width;
+    dst_par.height         = out_height;
+    dst_par.x_offset       = 0;
+    dst_par.y_offset       = 0;
+    dst_par.format         = vsp_info->out_format;
+    dst_par.pxa            = VSP_PAD_P;
+    dst_par.pad            = 0xff;
+    dst_par.x_coffset      = 0;
+    dst_par.y_coffset      = 0;
+    dst_par.iturbt         = VSP_ITURBT_709;
+    dst_par.clrcng         = VSP_ITU_COLOR;
+    dst_par.cbrm           = VSP_CSC_ROUND_DOWN;
+    dst_par.abrm           = VSP_CONVERSION_ROUNDDOWN;
+    dst_par.athres         = 0;
+    dst_par.clmd           = VSP_CLMD_NO;
+    dst_par.dith           = VSP_NO_DITHER;
+    dst_par.swap           = vsp_info->out_swapbit;
   }
 
-  if (use_module == VSP_UDS_USE) {
-    /* Set T_VSP_UDS. */
-    ctrl_par.uds     = &uds_par;
-    memset(&uds_par, 0, sizeof(T_VSP_UDS));
-    uds_par.fmd      = VSP_FMD_NO;
-    uds_par.filcolor = 0x0000FF00; /* green */
-	uds_par.amd      = VSP_AMD;
+  {
+    /* Setting resize parameters */
+    if (use_module == VSP_UDS_USE) {
+      /* Set T_VSP_UDS. */
+      ctrl_par.uds         = &uds_par;
 
-	uds_par.clip		= VSP_CLIP_OFF;
-	uds_par.alpha		= VSP_ALPHA_ON;
-	uds_par.complement	= VSP_COMPLEMENT_BIL;
-	uds_par.athres0		= 0;
-	uds_par.athres1		= 0;
-	uds_par.anum0		= 0;
-	uds_par.anum1		= 0;
-	uds_par.anum2	= 0;
-
-    uds_par.x_ratio     = (unsigned short)( (in_width << 12) / out_width );
-    uds_par.y_ratio     = (unsigned short)( (in_height << 12) / out_height );
-    uds_par.out_cwidth  = (unsigned short)out_width;
-    uds_par.out_cheight = (unsigned short)out_height;
-    uds_par.connect     = 0;
+      memset(&uds_par, 0, sizeof(T_VSP_UDS));
+      uds_par.fmd          = VSP_FMD_NO;
+      uds_par.filcolor     = 0x0000FF00; /* green */
+      uds_par.amd          = VSP_AMD;
+      uds_par.clip         = VSP_CLIP_OFF;
+      uds_par.alpha        = VSP_ALPHA_ON;
+      uds_par.complement   = VSP_COMPLEMENT_BIL;
+      uds_par.athres0      = 0;
+      uds_par.athres1      = 0;
+      uds_par.anum0        = 0;
+      uds_par.anum1        = 0;
+      uds_par.anum2        = 0;
+      uds_par.x_ratio      = (unsigned short)( (in_width << 12) / out_width );
+      uds_par.y_ratio      = (unsigned short)( (in_height << 12) / out_height );
+      uds_par.out_cwidth   = (unsigned short)out_width;
+      uds_par.out_cheight  = (unsigned short)out_height;
+      uds_par.connect      = 0;
+    }
   }
 
-
-  vsp_par.rpf_num   = 1;
-  vsp_par.use_module  = use_module;
-  vsp_par.src1_par  = &src_par;
-  vsp_par.src2_par  = NULL;
-  vsp_par.src3_par  = NULL;
-  vsp_par.src4_par  = NULL;
-  vsp_par.dst_par   = &dst_par;
-  vsp_par.ctrl_par  = &ctrl_par;
+  {
+    /* Update all settings */
+    vsp_par.rpf_num        = 1;
+    vsp_par.use_module     = use_module;
+    vsp_par.src1_par       = &src_par;
+    vsp_par.src2_par       = NULL;
+    vsp_par.src3_par       = NULL;
+    vsp_par.src4_par       = NULL;
+    vsp_par.dst_par        = &dst_par;
+    vsp_par.ctrl_par       = &ctrl_par;
+  }
 
   memset(&vspm_ip, 0, sizeof(VSPM_IP_PAR));
-  vspm_ip.uhType    = VSPM_TYPE_VSP_AUTO;
+  vspm_ip.uhType             = VSPM_TYPE_VSP_AUTO;
   vspm_ip.unionIpParam.ptVsp = &vsp_par;
 
   ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
   if (ercd) {
-    printf("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
     return GST_FLOW_ERROR;
   }
