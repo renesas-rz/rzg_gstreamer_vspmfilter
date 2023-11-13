@@ -547,7 +547,7 @@ gst_vspm_filter_allocate_buffer (GstVspmFilter * space)
                                        &vspm_out->vspm[vspm_used].pphy_addr,
                                        &vspm_out->vspm[vspm_used].phard_addr,
                                        &vspm_out->vspm[vspm_used].puser_virt_addr,
-                                       MMNGR_VA_SUPPORT)) {
+                                       MMNGR_VA_SUPPORT_CACHED)) {
       vspm_out->used++;
       if (space->use_dmabuf) {
         buf = gst_buffer_new ();
