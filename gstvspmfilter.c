@@ -489,28 +489,33 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
 
     buf_info->plane_offset[i] = buf_info->outbuf_size;
 
-    /* If we have alignment requirement from downstream */
-    if (align != NULL) {
-      /* FIXME: Currently, we ignore padding and only update stride */
-      stride = GST_ROUND_UP_N(stride, align->stride_align[i]);
-    }
-
-    /* Check output stride whether 32 pixels alignment or not */
-    if (stride % ISU_STRIDE_ALIGN) {
-      stride = GST_ROUND_UP_N(stride, ISU_STRIDE_ALIGN);
-    }
-
-    /* Check output address whether 512 bytes alignment or not */
-    if ((stride * sliceheight) % ISU_ADDR_ALIGN) {
-      if (!(sliceheight % 8)) {
-        stride = GST_ROUND_UP_N(stride, 64);
-      } else if (!(sliceheight % 4)) {
-        stride = GST_ROUND_UP_N(stride, 128);
-      } else if (!(sliceheight % 2)) {
-        stride = GST_ROUND_UP_N(stride, 256);
-      } else {
-        /* do nothing */
+    if (i == GST_VIDEO_COMP_Y) {
+      /* If we have alignment requirement from downstream */
+      if (align != NULL) {
+        /* FIXME: Currently, we ignore padding and only update stride */
+        stride = GST_ROUND_UP_N(stride, align->stride_align[i]);
       }
+
+      /* Check output stride whether 32 pixels alignment or not */
+      if (stride % ISU_STRIDE_ALIGN) {
+        stride = GST_ROUND_UP_N(stride, ISU_STRIDE_ALIGN);
+      }
+
+      /* Check output address whether 512 bytes alignment or not */
+      if ((stride * sliceheight) % ISU_ADDR_ALIGN) {
+        if (!(sliceheight % 8)) {
+          stride = GST_ROUND_UP_N(stride, 64);
+        } else if (!(sliceheight % 4)) {
+          stride = GST_ROUND_UP_N(stride, 128);
+        } else if (!(sliceheight % 2)) {
+          stride = GST_ROUND_UP_N(stride, 256);
+        } else {
+          /* do nothing */
+        }
+      }
+    } else {
+      /* Update stride of plane UV following the stride of plane Y */
+      stride = buf_info->plane_stride[0];
     }
 
     buf_info->plane_stride[i] = stride;
