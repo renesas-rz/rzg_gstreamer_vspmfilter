@@ -1106,17 +1106,15 @@ static void cb_func(
 }
 
 static GstFlowReturn
-find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
-    gpointer *out_phy1, gpointer *out_phy2)
+find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
 {
-  struct MM_PARAM p_adr[2];
+  struct MM_PARAM p_adr;
   GstFlowReturn ret;
   gint page_size, max_size_in_page;
 
   /* change virtual address to physical address */
   memset(&p_adr, 0, sizeof(p_adr));
-  p_adr[0].user_virt_addr = (unsigned long)in_vir1;
-  p_adr[1].user_virt_addr = (unsigned long)in_vir2;
+  p_adr.user_virt_addr = (unsigned long)in_vir;
   ret = ioctl(space->vsp_info->mmngr_fd, MM_IOC_VTOP, &p_adr);
   if (ret) {
     GST_ERROR ("MMNGR VtoP Convert Error. \n");
@@ -1126,13 +1124,10 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir1, gpointer in_vir2,
    * start of page. If there is an offset from page, we need to add it here */
   page_size = getpagesize ();
   max_size_in_page = page_size - 1;
-  if ((p_adr[0].hard_addr & max_size_in_page) == 0)
-    p_adr[0].hard_addr += (max_size_in_page & (unsigned long)in_vir1);
-  if ((p_adr[1].hard_addr & max_size_in_page) == 0)
-    p_adr[1].hard_addr += (max_size_in_page & (unsigned long)in_vir2);
+  if ((p_adr.hard_addr & max_size_in_page) == 0)
+    p_adr.hard_addr += (max_size_in_page & (unsigned long)in_vir);
 
-  if (out_phy1 != NULL) *out_phy1 = (gpointer) p_adr[0].hard_addr;
-  if (out_phy2 != NULL) *out_phy2 = (gpointer) p_adr[1].hard_addr;
+  if (out_phy != NULL) *out_phy = (gpointer) p_adr.hard_addr;
   return GST_FLOW_OK;
 }
 
@@ -1252,23 +1247,21 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     /* UDS scaling */
     use_module = VSP_UDS_USE;
   }
-
-  ret = find_physical_address (space, in_frame->data[0], out_frame->data[0],
-      &src_addr[0], &dst_addr[0]);
+  ret = find_physical_address (space, in_frame->data[0],  &src_addr[0]);
   if (!src_addr[0] || ret) {
     buf = in_frame->buffer;
     mem = gst_buffer_peek_memory (buf, 0);
     gst_vspm_filter_import_fd (mem, &src_addr[0], space->mmngr_import_list);
   }
+  ret = find_physical_address (space, out_frame->data[0],  &dst_addr[0]);
   if (!dst_addr[0] || ret) {
     buf = out_frame->buffer;
     mem = gst_buffer_peek_memory (buf, 0);
     gst_vspm_filter_import_fd (mem, &dst_addr[0], space->mmngr_import_list);
   }
 
-  if (in_n_planes >= 2 || out_n_planes >= 2) {
-    ret = find_physical_address (space, in_frame->data[1], out_frame->data[1],
-        &src_addr[1], &dst_addr[1]);
+  if (in_n_planes >= 2) {
+    ret = find_physical_address (space, in_frame->data[1],  &src_addr[1]);
     if (!src_addr[1] || ret) {
       buf = in_frame->buffer;
       if (gst_buffer_n_memory(buf) > 1) {
@@ -1282,6 +1275,9 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
         goto err;
       }
     }
+  }
+  if (out_n_planes >= 2) {
+    ret = find_physical_address (space, out_frame->data[1],  &dst_addr[1]);
     if (!dst_addr[1] || ret) {
       buf = out_frame->buffer;
       if (gst_buffer_n_memory(buf) > 1) {
@@ -1297,9 +1293,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     }
   }
 
-  if (in_n_planes >= 3 || out_n_planes >= 3) {
-    ret = find_physical_address (space, in_frame->data[2], out_frame->data[2],
-        &src_addr[2], &dst_addr[2]);
+  if (in_n_planes >= 3) {
+    ret = find_physical_address (space, in_frame->data[2],  &src_addr[2]);
     if (!src_addr[2] || ret) {
       buf = in_frame->buffer;
       if (gst_buffer_n_memory(buf) > 2) {
@@ -1313,6 +1308,9 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
         goto err;
       }
     }
+  }
+  if (out_n_planes >= 3) {
+    ret = find_physical_address (space, out_frame->data[2],  &dst_addr[2]);
     if (!dst_addr[2] || ret) {
       buf = out_frame->buffer;
       if (gst_buffer_n_memory(buf) > 2) {
