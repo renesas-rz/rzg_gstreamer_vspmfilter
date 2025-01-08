@@ -494,6 +494,14 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
     gint sliceheight = buf_info->plane_height[i];
 
     buf_info->plane_offset[i] = buf_info->outbuf_size;
+
+    /* If we have alignment requirement from downstream */
+    if (align) {
+      /* FIXME: Currently, we ignore padding and only update stride */
+      stride = GST_ROUND_UP_N(stride, align->stride_align[i]);
+    } else {
+      GST_DEBUG_OBJECT (space, "No stride alignment requirement from downstream");
+    }
     buf_info->plane_stride[i] = stride;
     buf_info->plane_size[i] = stride * sliceheight;
 
