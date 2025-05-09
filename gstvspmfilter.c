@@ -399,6 +399,9 @@ static const struct extensions_t exts[] = {
   {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
+#ifdef HAS_GRAY10_LE64
+  {GST_VIDEO_FORMAT_GRAY10_LE64,ISU_RAW10,      ISU_SWAP_NO},
+#endif
 };
 
 static const struct extensions_t exts_out[] = {
@@ -418,6 +421,9 @@ static const struct extensions_t exts_out[] = {
   {GST_VIDEO_FORMAT_YUY2,       ISU_YUV422_YUY2,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_NV16,       ISU_YUV422_NV16,ISU_SWAP_NO},
   {GST_VIDEO_FORMAT_GRAY8,      ISU_RAW8,       ISU_SWAP_NO},
+#ifdef HAS_GRAY10_LE64
+  {GST_VIDEO_FORMAT_GRAY10_LE64,ISU_RAW10,      ISU_SWAP_NO},
+#endif
 };
 
 static gint
@@ -486,6 +492,14 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
   for (i = 0; i < buf_info->n_planes; i++) {
     gint stride = buf_info->plane_width[i] * buf_info->plane_pixel_stride[i];
     gint sliceheight = buf_info->plane_height[i];
+
+#ifdef HAS_GRAY10_LE64
+    /* INFO: Renesas defined format. 10-bit grayscale, packed into 64bit words
+     *       with 6 pixels and 4 bits padding. */
+    if (buf_info->format == GST_VIDEO_FORMAT_GRAY10_LE64) {
+      stride = (buf_info->plane_width[i] + 5) / 6 * 8;
+    }
+#endif
 
     buf_info->plane_offset[i] = buf_info->outbuf_size;
 
