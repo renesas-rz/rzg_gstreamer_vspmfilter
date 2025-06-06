@@ -498,7 +498,13 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
     /* If we have alignment requirement from downstream */
     if (align) {
       /* FIXME: Currently, we ignore padding and only update stride */
-      stride = GST_ROUND_UP_N(stride, align->stride_align[i]);
+
+      /* According to the implementation of Gstreamer, stride_align, logically,
+       * must be a number equal to 2^N-1 instead of 2^N. Downstream proposes
+       * alignment as 2^N in the older versions and 2^N-1 in the new version.
+       * So, we should round the alignment up before using to get the same
+       * result for both cases */
+      stride = GST_ROUND_UP_N(stride, GST_ROUND_UP_2(align->stride_align[i]));
     } else {
       GST_DEBUG_OBJECT (space, "No stride alignment requirement from downstream");
     }
