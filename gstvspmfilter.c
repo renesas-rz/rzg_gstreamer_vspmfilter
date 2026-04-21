@@ -145,7 +145,8 @@ enum
 {
   PROP_0,
   PROP_VSPM_OUTBUF,
-  PROP_VSPM_DMABUF
+  PROP_VSPM_DMABUF,
+  PROP_VSPM_CROP
 };
 
 static void
@@ -251,6 +252,7 @@ static GstCaps *
 gst_vspm_filter_fixate_caps (GstBaseTransform * trans,
     GstPadDirection direction, GstCaps * caps, GstCaps * othercaps)
 {
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
   GstCaps *result;
   gint from_w, from_h;
   gint w = 0, h = 0;
@@ -272,8 +274,21 @@ gst_vspm_filter_fixate_caps (GstBaseTransform * trans,
   gst_structure_get_int (outs, "height", &h);
 
   if (!w || !h) {
-    gst_structure_fixate_field_nearest_int (outs, "height", from_h);
-    gst_structure_fixate_field_nearest_int (outs, "width", from_w);
+    if (space->enable_crop && direction == GST_PAD_SINK) {
+      /* When going SINK->SRC with crop enabled, propose cropped dimensions */
+      gint crop_w = from_w - space->crop.left - space->crop.right;
+      gint crop_h = from_h - space->crop.top  - space->crop.bottom;
+      if (crop_w > 0 && crop_h > 0) {
+        gst_structure_fixate_field_nearest_int (outs, "width", crop_w);
+        gst_structure_fixate_field_nearest_int (outs, "height", crop_h);
+      } else {
+        gst_structure_fixate_field_nearest_int (outs, "width", from_w);
+        gst_structure_fixate_field_nearest_int (outs, "height", from_h);
+      }
+    } else {
+      gst_structure_fixate_field_nearest_int (outs, "height", from_h);
+      gst_structure_fixate_field_nearest_int (outs, "width", from_w);
+    }
   }
 
   result = gst_caps_intersect (othercaps, caps);
@@ -946,6 +961,11 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
       g_param_spec_boolean ("dmabuf-use", "Use DMABUF mode",
         "Whether or not to use dmabuf for output buffer",
         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_VSPM_CROP,
+      g_param_spec_string ("crop", "Crop information",
+        "Crop input frames. Format: \"left:right:top:bottom\" in pixels.",
+        NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+        GST_PARAM_MUTABLE_READY));
   gstelement_class->change_state = gst_vspmfilter_change_state;
   gstbasetransform_class->transform_caps =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_transform_caps);
@@ -1067,6 +1087,13 @@ gst_vspm_filter_init (GstVspmFilter * space)
   space->first_buff = 1;
   space->mmngr_import_list = g_queue_new ();
 
+  /* Initialize crop to disabled */
+  space->crop.left   = 0;
+  space->crop.right  = 0;
+  space->crop.top    = 0;
+  space->crop.bottom = 0;
+  space->enable_crop = FALSE;
+
   for (i = 0; i < sizeof(vspm_in->vspm)/sizeof(vspm_in->vspm[0]); i++) {
     for (j = 0; j < GST_VIDEO_MAX_PLANES; j++)
       vspm_in->vspm[i].dmabuf_pid[j] = -1;
@@ -1077,6 +1104,49 @@ gst_vspm_filter_init (GstVspmFilter * space)
   }
 
   sem_init (&space->smp_wait, 0, 0);
+}
+
+static gboolean
+gst_vspm_filter_parse_cropsize (GObject * object, const GValue * value)
+{
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (object);
+  const gchar *str_value = g_value_get_string (value);
+
+  gchar **str_arr, *end_char;
+  gint length = 4; /* fixed-size array */
+  gint64 crop_arr[4] = { 0, };
+  gint i;
+
+  str_arr = g_strsplit (str_value, ":", length);
+  if (str_arr == NULL)
+    goto error;
+
+  for (i = 0; i < length; i++) {
+    if (str_arr[i] == NULL || *str_arr[i] == '\0') /* Empty string */
+      goto error;
+    else
+      crop_arr[i] = g_ascii_strtoll(str_arr[i], &end_char, 10);
+
+    if (*end_char != '\0') /* Invalid end character */
+      goto error;
+    if (crop_arr[i] < 0 || crop_arr[i] > G_MAXINT)
+      goto error;
+  }
+  g_strfreev (str_arr);
+
+  space->crop.left   = crop_arr[0];
+  space->crop.right  = crop_arr[1];
+  space->crop.top    = crop_arr[2];
+  space->crop.bottom = crop_arr[3];
+
+  return TRUE;
+
+error:
+  GST_ERROR_OBJECT (space, "Failed to parse crop size: %s. Using default instead",
+                    str_value);
+  if (str_arr)
+    g_strfreev (str_arr);
+  return FALSE;
 }
 
 void
@@ -1096,6 +1166,9 @@ gst_vspm_filter_set_property (GObject * object, guint property_id,
       if (space->use_dmabuf)
           space->outbuf_allocate = TRUE;
       break;
+    case PROP_VSPM_CROP:
+      space->enable_crop = gst_vspm_filter_parse_cropsize (object, value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -1114,6 +1187,17 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
     case PROP_VSPM_DMABUF:
       g_value_set_boolean (value, space->use_dmabuf);
       break;
+    case PROP_VSPM_CROP:
+    {
+      gchar *str_value = g_strdup_printf ("%d:%d:%d:%d",
+                                          space->crop.left,
+                                          space->crop.right,
+                                          space->crop.top,
+                                          space->crop.bottom);
+      g_value_set_string (value, str_value);
+      g_free (str_value);
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -1450,17 +1534,47 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
   {
     /* Setting resize parameters */
+    guint crop_in_width  = 0;
+    guint crop_in_height = 0;
+    guint crop_start_x   = 0;
+    guint crop_start_y   = 0;
+
     memset(&rs_par, 0, sizeof(T_ISU_RS));
-    rs_par.start_x        = 0;
-    rs_par.start_y        = 0;
+
+    /* Validate crop parameters against input dimensions */
+    if ((space->crop.left + space->crop.right) >= in_width) {
+      GST_ERROR ("Crop left(%u) + right(%u) >= input width(%d)\n",
+                 space->crop.left, space->crop.right, in_width);
+      ret = GST_FLOW_ERROR;
+      goto err;
+    }
+    if ((space->crop.top + space->crop.bottom) >= in_height) {
+      GST_ERROR ("Crop top(%u) + bottom(%u) >= input height(%d)\n",
+                 space->crop.top, space->crop.bottom, in_height);
+      ret = GST_FLOW_ERROR;
+      goto err;
+    }
+
+    crop_start_x   = space->crop.left;
+    crop_start_y   = space->crop.top;
+    crop_in_width  = in_width  - space->crop.left - space->crop.right;
+    crop_in_height = in_height - space->crop.top  - space->crop.bottom;
+
+    GST_DEBUG_OBJECT (space,
+        "crop: start(%u,%u) cropped size(%ux%u) from input(%dx%d)",
+        crop_start_x, crop_start_y, crop_in_width, crop_in_height,
+        in_width, in_height);
+
+    rs_par.start_x        = crop_start_x;
+    rs_par.start_y        = crop_start_y;
     rs_par.tune_x         = 0;
     rs_par.tune_y         = 0;
     rs_par.crop_w         = out_width;
     rs_par.crop_h         = out_height;
     rs_par.pad_mode       = 0;
     rs_par.pad_val        = 0;
-    rs_par.x_ratio        = (unsigned short)( (in_width << 12) / out_width );
-    rs_par.y_ratio        = (unsigned short)( (in_height << 12) / out_height );
+    rs_par.x_ratio        = (unsigned short)( (crop_in_width << 12) / out_width );
+    rs_par.y_ratio        = (unsigned short)( (crop_in_height << 12) / out_height );
     if (!(rs_par.x_ratio & 0x0000F000) || !(rs_par.y_ratio & 0x0000F000)) {
       GST_ERROR("ISU driver does not support scale up\n");
       ret = GST_FLOW_ERROR;

@@ -193,6 +193,14 @@ struct _GstVspmFilter {
   GQueue *mmngr_import_list;
   gint first_buff;
   sem_t smp_wait;
+  /* Crop parameters */
+  struct {
+    guint32 left;
+    guint32 right;
+    guint32 top;
+    guint32 bottom;
+  } crop;
+  gboolean enable_crop;
 };
 
 struct _GstVspmFilterClass
