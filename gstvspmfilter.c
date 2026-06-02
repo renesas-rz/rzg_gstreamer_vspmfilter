@@ -100,6 +100,13 @@ static void gst_vspm_filter_finalize (GObject * obj);
 
 static void gst_vspm_filter_import_fd (GstMemory *mem, gpointer *out, GQueue *import_list);
 static void gst_vspm_filter_release_fd (GQueue *import_list);
+static void gst_vspm_filter_compute_csc (guint              src_fmt,
+                                         GstVideoColorRange in_range,
+                                         guint              dst_fmt,
+                                         GstVideoColorRange out_range,
+                                         gdouble            Kr,
+                                         gdouble            Kb,
+                                         T_ISU_CSC         *csc_par);
 
 struct _GstBaseTransformPrivate
 {
@@ -700,10 +707,13 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     GstVideoInfo * out_info)
 {
   GstVspmFilter *space;
+  GstVspmFilterVspInfo *vsp_info;
   GstStructure *structure;
   gint i;
 
   space = GST_VIDEO_CONVERT_CAST (filter);
+  vsp_info = space->vsp_info;
+
   /* these must match */
   if (in_info->fps_n != out_info->fps_n || in_info->fps_d != out_info->fps_d)
     goto format_mismatch;
@@ -714,6 +724,61 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
 
   GST_DEBUG ("reconfigured %d %d", GST_VIDEO_INFO_FORMAT (in_info),
       GST_VIDEO_INFO_FORMAT (out_info));
+
+  /* Pre-compute ISU CSC */
+  {
+    guint in_fmt, out_fmt, in_swap, out_swap;
+    GstVideoColorRange in_range, out_range;
+    g_clear_pointer (&vsp_info->cached_csc, g_free);
+
+    if (set_colorspace (GST_VIDEO_INFO_FORMAT (in_info),
+                        &in_fmt, &in_swap) != 0 ||
+        set_colorspace_output (GST_VIDEO_INFO_FORMAT (out_info),
+                               &out_fmt, &out_swap) != 0) {
+      GST_ERROR_OBJECT (space, "input/output format is not supported.");
+      return FALSE;
+    }
+
+    in_range  = in_info->colorimetry.range;
+    out_range = out_info->colorimetry.range;
+
+    if (((in_fmt & 0xF0) == (out_fmt & 0xF0)) &&
+        ((in_range  == GST_VIDEO_COLOR_RANGE_UNKNOWN) ||
+         (out_range == GST_VIDEO_COLOR_RANGE_UNKNOWN) ||
+         (in_range  == out_range))) {
+      /* Do nothing; skip color space conversion */
+    } else {
+      GstVideoColorMatrix matrix;
+      gdouble Kr, Kb;
+
+      vsp_info->cached_csc = g_malloc0 (sizeof (T_ISU_CSC));
+
+      /* Pick Kr/Kb from the YUV side. Cross-matrix YUV-to-YUV (e.g. BT.601
+       * input + BT.709 output) is not supported.
+       */
+      if ((in_fmt & 0xF0) == YUV_FORMAT)
+        matrix = in_info->colorimetry.matrix;
+      else if ((out_fmt & 0xF0) == YUV_FORMAT)
+        matrix = out_info->colorimetry.matrix;
+      else
+        matrix = GST_VIDEO_COLOR_MATRIX_UNKNOWN;
+
+      if (!gst_video_color_matrix_get_Kr_Kb (matrix, &Kr, &Kb)) {
+        GST_DEBUG_OBJECT (space,
+            "No Kr/Kb for matrix=%d, fallback BT.601", matrix);
+        Kr = 0.299;
+        Kb = 0.114;
+      }
+      gst_vspm_filter_compute_csc (in_fmt, in_range,
+                                   out_fmt, out_range,
+                                   Kr, Kb, vsp_info->cached_csc);
+
+      GST_DEBUG_OBJECT (space,
+          "CSC pre-computed (in_fmt=0x%02x out_fmt=0x%02x "
+          "in_range=%d out_range=%d)",
+          in_fmt, out_fmt, in_range, out_range);
+    }
+  }
 
   if(space->outbuf_allocate) {
     gst_vspm_filter_set_buffer_info (space, out_info, NULL);
@@ -1013,8 +1078,10 @@ gst_vspm_filter_finalize (GObject * obj)
   if (vspm_in->used || vspm_out->used)
     gst_vspm_filter_free_buffer (space);
 
-  if (space->vsp_info)
+  if (space->vsp_info) {
+    g_free (vsp_info->cached_csc);
     g_free (space->vsp_info);
+  }
   if (space->mmngr_import_list)
     g_queue_free (space->mmngr_import_list);
   if (space->vspm_in)
@@ -1065,6 +1132,7 @@ gst_vspm_filter_init (GstVspmFilter * space)
   vsp_info->is_init_vspm = FALSE;
   vsp_info->format_flag = 0;
   vsp_info->mmngr_fd = -1;
+  vsp_info->cached_csc = NULL;
   /* mmngr dev open */
   vsp_info->mmngr_fd = open(DEVFILE, O_RDWR);
   if (vsp_info->mmngr_fd == -1) {
@@ -1273,6 +1341,231 @@ gst_vspm_filter_release_fd (GQueue *import_list)
   }
 }
 
+/* Convert a floating-point coefficient to ISU 14-bit two's complement
+ * fixed-point (×1024). */
+static unsigned int
+fp_to_isu_fixed (gdouble val)
+{
+  gint ival = (gint) ((val * 1024.0) + (val < 0 ? -0.5 : 0.5));
+  if (ival < 0)
+    ival = 0x4000 + ival;  /* 14-bit two's complement */
+  return (unsigned int) (ival & 0x3FFF);
+}
+
+/*
+ * gst_vspm_filter_compute_csc:
+ * @src_fmt:    input format
+ * @in_range:   input color range; checked against GST_VIDEO_COLOR_RANGE_16_235
+ * to treat as limited range; otherwise treated as full range.
+ * @dst_fmt:    output format
+ * @out_range:  output color range
+ * @Kr:         luma red coefficient   (BT.601: 0.299,  BT.709: 0.2126, BT.2020: 0.2627)
+ * @Kb:         luma blue coefficient  (BT.601: 0.114,  BT.709: 0.0722, BT.2020: 0.0593)
+ * @csc_par:    [out] filled T_ISU_CSC with k_matrix, offset, clip, csc=ISU_CSC_CUSTOM
+ */
+static void
+gst_vspm_filter_compute_csc (guint              src_fmt,
+                             GstVideoColorRange in_range,
+                             guint              dst_fmt,
+                             GstVideoColorRange out_range,
+                             gdouble            Kr,
+                             gdouble            Kb,
+                             T_ISU_CSC         *csc_par)
+{
+  gdouble Kg = 1.0 - Kr - Kb;
+
+  gboolean in_limited  = (in_range  == GST_VIDEO_COLOR_RANGE_16_235);
+  gboolean out_limited = (out_range == GST_VIDEO_COLOR_RANGE_16_235);
+
+  /* Scale factors for range conversion.
+   *
+   * Y scale  : 219 levels (16-235)
+   * C scale  : 224 levels (16-240)
+   *
+   * For RGB, Y scale is reused because RGB limited range is also
+   * represented as [16,235]. Therefore:
+   *   - RGB channels use *_y_scale
+   *   - *_c_scale is only used for YUV chroma (Cb/Cr)
+   */
+  gdouble in_y_scale  = in_limited  ? (255.0 / 219.0) : 1.0;
+  gdouble in_c_scale  = in_limited  ? (255.0 / 224.0) : 1.0;
+  gdouble out_y_scale = out_limited ? (219.0 / 255.0) : 1.0;
+  gdouble out_c_scale = out_limited ? (224.0 / 255.0) : 1.0;
+
+  /* 3×3 matrix in mathematical channel order (before ISU column swizzle) */
+  gdouble math_m[3][3] = {{0}};
+
+  /* Per-channel offsets in ISU channel order */
+  unsigned int in_off[3]  = {0, 0, 0};
+  unsigned int out_off[3] = {0, 0, 0};
+
+  guint src_fam = src_fmt & 0xF0;
+  guint dst_fam = dst_fmt & 0xF0;
+
+  if (src_fam == YUV_FORMAT && dst_fam != YUV_FORMAT && dst_fam != RAW_FORMAT) {
+    /* ── YUV to RGB ── */
+    /* Math cols: [Y, Cb, Cr], Math rows: [R, G, B] */
+    gdouble base[3][3] = {
+      { 1.0,  0.0,                 2.0 * (1.0 - Kr)   },
+      { 1.0, -2.0*Kb*(1.0-Kb)/Kg, -2.0*Kr*(1.0-Kr)/Kg },
+      { 1.0,  2.0 * (1.0 - Kb),    0.0                },
+    };
+    gdouble col_s[3] = { in_y_scale, in_c_scale, in_c_scale };
+    gdouble row_s[3] = { out_y_scale, out_y_scale, out_y_scale };
+
+    for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+        math_m[r][c] = base[r][c] * col_s[c] * row_s[r];
+
+    in_off[0] = in_limited ? 0x10 : 0x00;
+    in_off[1] = 0x80;
+    in_off[2] = 0x80;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+    out_off[1] = out_limited ? 0x10 : 0x00;
+    out_off[2] = out_limited ? 0x10 : 0x00;
+
+  } else if (src_fam != YUV_FORMAT && src_fam != RAW_FORMAT && dst_fam == YUV_FORMAT) {
+    /* ── RGB to YUV ── */
+    /* Math cols: [R, G, B], Math rows: [Y, Cb, Cr] */
+    gdouble base[3][3] = {
+      {  Kr,                 Kg,                 Kb                },
+      { -Kr/(2.0*(1.0-Kb)), -Kg/(2.0*(1.0-Kb)),  0.5               },
+      {  0.5,               -Kg/(2.0*(1.0-Kr)), -Kb/(2.0*(1.0-Kr)) },
+    };
+    gdouble col_s[3] = { in_y_scale, in_y_scale, in_y_scale };
+    gdouble row_s[3] = { out_y_scale, out_c_scale, out_c_scale };
+
+    for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+        math_m[r][c] = base[r][c] * col_s[c] * row_s[r];
+
+    in_off[0] = in_limited ? 0x10 : 0x00;
+    in_off[1] = in_limited ? 0x10 : 0x00;
+    in_off[2] = in_limited ? 0x10 : 0x00;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+    out_off[1] = 0x80;
+    out_off[2] = 0x80;
+
+  } else if (src_fam == RAW_FORMAT && dst_fam != RAW_FORMAT && dst_fam != YUV_FORMAT) {
+    /* ── RAW to RGB ── */
+    gdouble scale = in_y_scale * out_y_scale;
+    math_m[0][0] = scale;
+    math_m[1][0] = scale;
+    math_m[2][0] = scale;
+
+    in_off[0]  = in_limited ? 0x10 : 0x00;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+    out_off[1] = out_limited ? 0x10 : 0x00;
+    out_off[2] = out_limited ? 0x10 : 0x00;
+
+  } else if (src_fam == RAW_FORMAT && dst_fam == YUV_FORMAT) {
+    /* ── RAW to YUV ── */
+    math_m[0][0] = in_y_scale * out_y_scale;
+
+    in_off[0]  = in_limited ? 0x10 : 0x00;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+    out_off[1] = 0x80;
+    out_off[2] = 0x80;
+
+  } else if (src_fam == YUV_FORMAT && dst_fam == RAW_FORMAT) {
+    /* ── YUV to RAW ── */
+    math_m[0][0] = in_y_scale * out_y_scale;
+
+    in_off[0] = in_limited ? 0x10 : 0x00;
+    in_off[1] = 0x80;
+    in_off[2] = 0x80;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+
+  } else if (src_fam != YUV_FORMAT && src_fam != RAW_FORMAT && dst_fam == RAW_FORMAT) {
+    /* ── RGB to RAW ── */
+    gdouble s = in_y_scale * out_y_scale;
+    math_m[0][0] = Kr * s;
+    math_m[0][1] = Kg * s;
+    math_m[0][2] = Kb * s;
+
+    in_off[0] = in_limited ? 0x10 : 0x00;
+    in_off[1] = in_limited ? 0x10 : 0x00;
+    in_off[2] = in_limited ? 0x10 : 0x00;
+    out_off[0] = out_limited ? 0x10 : 0x00;
+
+  } else if (src_fam == dst_fam) {
+    /* ── Same color: range-only conversion ── */
+    if (src_fam == YUV_FORMAT) {
+      math_m[0][0] = in_y_scale * out_y_scale;
+      math_m[1][1] = in_c_scale * out_c_scale;
+      math_m[2][2] = in_c_scale * out_c_scale;
+      in_off[0] = in_limited ? 0x10 : 0x00;
+      in_off[1] = 0x80;
+      in_off[2] = 0x80;
+      out_off[0] = out_limited ? 0x10 : 0x00;
+      out_off[1] = 0x80;
+      out_off[2] = 0x80;
+    } else if (src_fam == RAW_FORMAT) {
+      math_m[0][0] = in_y_scale * out_y_scale;
+      in_off[0]  = in_limited ? 0x10 : 0x00;
+      out_off[0] = out_limited ? 0x10 : 0x00;
+    } else {
+      /* RGB */
+      gdouble scale = in_y_scale * out_y_scale;
+      math_m[0][0] = scale;
+      math_m[1][1] = scale;
+      math_m[2][2] = scale;
+      for (int i = 0; i < 3; i++) {
+        in_off[i]  = in_limited ? 0x10 : 0x00;
+        out_off[i] = out_limited ? 0x10 : 0x00;
+      }
+    }
+  }
+
+  /* ── Column swizzle: math order to ISU hardware column order ──
+   *
+   * ISU column mapping (input side):
+   *   YUV input: matrix columns = [Y(layer1), Cr(layer3), Cb(layer2)]
+   *   RGB input: matrix columns = [R(layer1), B(layer3), G(layer2)]
+   * Both are: [col0=math0, col1=math2, col2=math1] — swap cols 1 & 2.
+   */
+  int col_map[3] = {0, 2, 1};
+  /* Encode k_matrix to fixed-point */
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++)
+      csc_par->k_matrix[r][c] = fp_to_isu_fixed (math_m[r][col_map[c]]);
+
+  /* Encode offsets */
+  for (int ch = 0; ch < 3; ch++) {
+    csc_par->offset[ch][0] = in_off[ch];
+    csc_par->offset[ch][1] = out_off[ch];
+  }
+
+  /* Encode clip based on output range and format */
+  if (out_limited) {
+    if (dst_fam == YUV_FORMAT) {
+      /* Y: [16,235] */
+      csc_par->clip[0][0] = 0x10;
+      csc_par->clip[0][1] = 0xEB;
+      /* Cb: [16,240] */
+      csc_par->clip[1][0] = 0x10;
+      csc_par->clip[1][1] = 0xF0;
+      /* Cr: [16,240] */
+      csc_par->clip[2][0] = 0x10;
+      csc_par->clip[2][1] = 0xF0;
+    } else {
+      for (int ch = 0; ch < 3; ch++) {
+        /* RGB/RAW limited: [16,235] */
+        csc_par->clip[ch][0] = 0x10;
+        csc_par->clip[ch][1] = 0xEB;
+      }
+    }
+  } else {
+    for (int ch = 0; ch < 3; ch++) {
+      /* Full: [0,255] */
+      csc_par->clip[ch][0] = 0x00;
+      csc_par->clip[ch][1] = 0xFF;
+    }
+  }
+
+  csc_par->csc = ISU_CSC_CUSTOM;
+}
+
 static GstFlowReturn
 gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame)
@@ -1285,39 +1578,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
   T_ISU_IN src_par;
   T_ISU_ALPHA src_alpha_par, dst_alpha_par;
-  T_ISU_CSC csc_par;
   T_ISU_OUT dst_par;
   T_ISU_RS rs_par;
-
-  /* Matrix for converting from YUV to RGB */
-  unsigned int csc_k_matrix_a[3][3] = {{0x04A8, 0x0662, 0x0000},{0x04A8, 0x3CBF, 0x3E70},{0x04A8, 0x0000, 0x0812}};
-  unsigned int csc_offset_a[3][2]   = {{0x10,0x00},{0x80,0x00},{0x80,0x00}};
-  unsigned int csc_clip_a[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
-
-  /* Matrix for converting from RGB to YUV */
-  unsigned int csc_k_matrix_b[3][3] = {{0x0107, 0x0064, 0x0204},{0x3f68, 0x01c2, 0x3ed6},{0x01c2, 0x3fb7, 0x3e87}};
-  unsigned int csc_offset_b[3][2]   = {{0x00,0x10},{0x00,0x80},{0x00,0x80}};
-  unsigned int csc_clip_b[3][2]     = {{0x10,0xEB},{0x10,0xF0},{0x10,0xF0}};
-
-  /* Matrix for converting from RGB to RAW */
-  unsigned int csc_k_matrix_c[3][3] = {{0x0107, 0x0064, 0x0204},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
-  unsigned int csc_offset_c[3][2]   = {{0x00,0x10},{0x00,0x80},{0x00,0x80}};
-  unsigned int csc_clip_c[3][2]     = {{0x10,0xEB},{0x10,0xF0},{0x10,0xF0}};
-
-  /* Matrix for converting from RAW to RGB */
-  unsigned int csc_k_matrix_d[3][3] = {{0x0400, 0x0000, 0x0000},{0x0400, 0x0, 0x0},{0x0400, 0x0, 0x0}};
-  unsigned int csc_offset_d[3][2]   = {{0x00,0x00},{0x00,0x00},{0x00,0x00}};
-  unsigned int csc_clip_d[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
-
-  /* Matrix for converting from RAW to YUV */
-  unsigned int csc_k_matrix_e[3][3] = {{0x0400, 0x0000, 0x0000},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
-  unsigned int csc_offset_e[3][2]   = {{0x00,0x00},{0x00,0x80},{0x00,0x80}};
-  unsigned int csc_clip_e[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
-
-  /* Matrix for converting from YUV to RAW */
-  unsigned int csc_k_matrix_f[3][3] = {{0x04A8, 0x0000, 0x0000},{0x0, 0x0, 0x0},{0x0, 0x0, 0x0}};
-  unsigned int csc_offset_f[3][2]   = {{0x10,0x00},{0x80,0x00},{0x80,0x00}};
-  unsigned int csc_clip_f[3][2]     = {{0x00,0xFF},{0x00,0xFF},{0x00,0xFF}};
 
   gint in_width, in_height;
   gint out_width, out_height;
@@ -1486,49 +1748,7 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     dst_par.format        = vsp_info->out_format;
     dst_par.swap          = vsp_info->out_swapbit;
     /* Set csc for color convert */
-    if ((dst_par.format & 0xF0) == (src_par.format & 0xF0)) {
-      dst_par.csc         = NULL;
-    } else {
-      csc_par.csc = ISU_CSC_CUSTOM;
-      if ((src_par.format & RAW_FORMAT) == RAW_FORMAT) {
-        if ((dst_par.format & YUV_FORMAT) == YUV_FORMAT) {
-          /* Convert from RAW to YUV */
-          memcpy(csc_par.k_matrix, csc_k_matrix_e, sizeof(csc_k_matrix_e));
-          memcpy(csc_par.offset  , csc_offset_e  , sizeof(csc_offset_e));
-          memcpy(csc_par.clip    , csc_clip_e    , sizeof(csc_clip_e));
-        } else {
-          /* Convert from RAW to RGB */
-          memcpy(csc_par.k_matrix, csc_k_matrix_d, sizeof(csc_k_matrix_d));
-          memcpy(csc_par.offset  , csc_offset_d  , sizeof(csc_offset_d));
-          memcpy(csc_par.clip    , csc_clip_d    , sizeof(csc_clip_d));
-        }
-      } else if ((src_par.format & YUV_FORMAT) == YUV_FORMAT) {
-        if ((dst_par.format & RAW_FORMAT) == RAW_FORMAT) {
-          /* Convert from YUV to RAW */
-          memcpy(csc_par.k_matrix, csc_k_matrix_f, sizeof(csc_k_matrix_f));
-          memcpy(csc_par.offset  , csc_offset_f  , sizeof(csc_offset_f));
-          memcpy(csc_par.clip    , csc_clip_f    , sizeof(csc_clip_f));
-        } else {
-          /* Convert from YUV to RGB */
-          memcpy(csc_par.k_matrix, csc_k_matrix_a, sizeof(csc_k_matrix_a));
-          memcpy(csc_par.offset  , csc_offset_a  , sizeof(csc_offset_a));
-          memcpy(csc_par.clip    , csc_clip_a    , sizeof(csc_clip_a));
-        }
-      } else { /* src format is RGB */
-        if ((dst_par.format & RAW_FORMAT) == RAW_FORMAT) {
-          /* Convert from RGB to RAW */
-          memcpy(csc_par.k_matrix, csc_k_matrix_c, sizeof(csc_k_matrix_c));
-          memcpy(csc_par.offset  , csc_offset_c  , sizeof(csc_offset_c));
-          memcpy(csc_par.clip    , csc_clip_c    , sizeof(csc_clip_c));
-        } else if ((dst_par.format & YUV_FORMAT) == YUV_FORMAT) {
-          /* Convert from RGB to YUV */
-          memcpy(csc_par.k_matrix, csc_k_matrix_b, sizeof(csc_k_matrix_b));
-          memcpy(csc_par.offset  , csc_offset_b  , sizeof(csc_offset_b));
-          memcpy(csc_par.clip    , csc_clip_b    , sizeof(csc_clip_b));
-        }
-      }
-      dst_par.csc = &csc_par;
-    }
+    dst_par.csc           = (T_ISU_CSC *) vsp_info->cached_csc;
     dst_par.alpha         = &src_alpha_par;
   }
 

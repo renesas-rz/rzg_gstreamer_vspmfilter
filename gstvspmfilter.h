@@ -136,7 +136,7 @@ struct _GstVspmFilterVspInfo {
   guint  out_nplane;
   guint  out_swapbit;
   int mmngr_fd;   /* mmngr open id */
-  
+  gpointer cached_csc;
 };
 
 typedef struct {
