@@ -107,6 +107,8 @@ static void gst_vspm_filter_compute_csc (guint              src_fmt,
                                          gdouble            Kr,
                                          gdouble            Kb,
                                          T_ISU_CSC         *csc_par);
+static gboolean
+gst_vspm_filter_buffer_can_passthrough (GstVspmFilter * space, GstBuffer * buf);
 
 struct _GstBaseTransformPrivate
 {
@@ -896,6 +898,15 @@ static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * t
     vspm_out    = space->vspm_out;
     vspm_outbuf = space->vspm_outbuf;
 
+    gboolean base_passthrough = gst_base_transform_is_passthrough (trans);
+    gboolean do_passthrough   = base_passthrough &&
+                                gst_vspm_filter_buffer_can_passthrough (space, inbuf);
+
+    if (do_passthrough) {
+      return GST_BASE_TRANSFORM_CLASS (parent_class)->prepare_output_buffer (
+          trans, inbuf, outbuf);
+    }
+
     if(space->outbuf_allocate) {
       trans->priv->passthrough = 0; //disable pass-through mode
 
@@ -1310,6 +1321,126 @@ find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
 
   if (out_phy != NULL) *out_phy = (gpointer) p_adr.hard_addr;
   return GST_FLOW_OK;
+}
+
+/* TRUE if the dmabuf is one physically-contiguous block: a physical address
+ * resolves and the imported mapped_size covers the full mem size. */
+static gboolean
+gst_vspm_filter_dmabuf_is_contiguous (GstMemory * mem)
+{
+  int import_pid;
+  size_t mapped_size = 0;
+  gpointer phys_addr = NULL;
+  gsize mem_size;
+
+  if (!gst_is_dmabuf_memory (mem))
+    return FALSE;
+
+  if (R_MM_OK != mmngr_import_start_in_user_ext (&import_pid, &mapped_size,
+          (unsigned int *) &phys_addr, gst_dmabuf_memory_get_fd (mem), NULL))
+    return FALSE;
+
+  mmngr_import_end_in_user_ext (import_pid);
+
+  mem_size = gst_memory_get_sizes (mem, NULL, NULL);
+  return (phys_addr != NULL && mapped_size >= mem_size);
+}
+
+/* TRUE if the plane is physically contiguous: a dmabuf passing the import
+ * probe (dmabuf-use mode), or every page following the previous one. */
+static gboolean
+gst_vspm_filter_mem_is_contiguous (GstVspmFilter * space, GstBuffer * buf,
+    guint plane)
+{
+  GstMemory *mem = gst_buffer_peek_memory (buf, plane);
+  gint page_size = getpagesize ();
+  gpointer base = NULL;
+  GstMapInfo map;
+  gsize offset;
+
+  if (!mem)
+    return FALSE;
+
+  if (space->use_dmabuf)
+    return gst_vspm_filter_dmabuf_is_contiguous (mem);
+
+  if (!gst_memory_map (mem, &map, GST_MAP_READ))
+    return FALSE;
+
+  /* Physical address of the first page */
+  if (find_physical_address (space, map.data, &base) != GST_FLOW_OK) {
+    gst_memory_unmap (mem, &map);
+    return FALSE;
+  }
+
+  /* Every later page must follow directly on from the one before */
+  for (offset = page_size - ((guintptr) map.data & (page_size - 1));
+       offset < map.size; offset += page_size) {
+    gpointer phys = NULL;
+
+    if ((find_physical_address (space, (guint8 *) map.data + offset, &phys) != GST_FLOW_OK) ||
+        ((guintptr) phys != ((guintptr) base + offset))) {
+      gst_memory_unmap (mem, &map);
+      return FALSE;
+    }
+  }
+
+  gst_memory_unmap (mem, &map);
+  return TRUE;
+}
+
+/* TRUE if every input plane's stride and offset match the output. Layout is
+ * taken from the video meta if present, else from the negotiated input caps. */
+static gboolean
+gst_vspm_filter_buffer_layout_matches (GstVspmFilter * space, GstBuffer * buf)
+{
+  VspmBufferInfo *outbuf_info = &space->buf_info;
+  GstVideoInfo *in_info = &GST_VIDEO_FILTER (space)->in_info;
+  GstVideoMeta *vmeta = gst_buffer_get_video_meta (buf);
+  guint plane, n_planes = outbuf_info->n_planes;
+
+  if ((vmeta != NULL) && (vmeta->n_planes != n_planes))
+    return FALSE;
+
+  for (plane = 0; plane < n_planes; plane++) {
+    gsize in_stride, in_offset;
+
+    if (vmeta != NULL) {
+      in_stride = vmeta->stride[plane];
+      in_offset = vmeta->offset[plane];
+    } else {
+      in_stride = GST_VIDEO_INFO_PLANE_STRIDE (in_info, plane);
+      in_offset = GST_VIDEO_INFO_PLANE_OFFSET (in_info, plane);
+    }
+
+    if ((in_stride != (gsize) outbuf_info->plane_stride[plane]) ||
+        (in_offset != (gsize) outbuf_info->plane_offset[plane]))
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+/* TRUE if every plane is contiguous and its layout matches the output. */
+static gboolean
+gst_vspm_filter_buffer_can_passthrough (GstVspmFilter * space, GstBuffer * buf)
+{
+  guint plane, n_planes;
+
+  if (!buf)
+    return FALSE;
+
+  n_planes = gst_buffer_n_memory (buf);
+
+  for (plane = 0; plane < n_planes; plane++) {
+    if (!gst_vspm_filter_mem_is_contiguous (space, buf, plane))
+      return FALSE;
+  }
+
+  if (!gst_vspm_filter_buffer_layout_matches (space, buf))
+    return FALSE;
+
+  return TRUE;
 }
 
 static void
