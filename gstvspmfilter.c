@@ -59,10 +59,6 @@ GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
 #define VSP_FORMAT_PIXEL_MASK	(0x0f00)
 #define VSP_FORMAT_PIXEL_BIT	(8)
 
-/* number buffers of buffer pool */
-#define MIN_BUFFERS (5)
-#define MAX_BUFFERS (5)
-
 /* isu hardware limitation */
 #define ISU_STRIDE_ALIGN (32)
 #define ISU_ADDR_ALIGN   (512)
@@ -85,10 +81,16 @@ gst_vspm_filter_transform_buffer (GstVideoFilter * filter,
                                     GstBuffer * inbuf,
                                     GstBuffer * outbuf);
 
-static GstFlowReturn gst_vspm_filter_allocate_buffer (GstVspmFilter * space);
-static void gst_vspm_filter_free_buffer (GstVspmFilter * space);
-static void gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
+static void gst_vspm_filter_free_buffer_pools (GstVspmFilter * space);
+static void gst_vspm_filter_set_buffer_info (GstVspmFilter * space, VspmBufferInfo * buf_info,
     GstVideoInfo * info, GstVideoAlignment * align);
+
+static GstFlowReturn gst_vspm_filter_get_mem_phys_addr (GstVspmFilter * space,
+    GstBuffer * buf, gpointer vir_addr, guint plane, gsize plane_offset,
+    gpointer * out_phy);
+
+static gboolean gst_vspm_filter_propose_allocation (GstBaseTransform * trans,
+    GstQuery * decide_query, GstQuery * query);
 
 static gboolean gst_vspm_filter_set_info (GstVideoFilter * filter,
     GstCaps * incaps, GstVideoInfo * in_info, GstCaps * outcaps,
@@ -98,7 +100,7 @@ static GstFlowReturn gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
 static void gst_vspm_filter_finalize (GObject * obj);
 
-static void gst_vspm_filter_import_fd (GstMemory *mem, gpointer *out, GQueue *import_list);
+static void gst_vspm_filter_import_fd (GstMemory *mem, gsize plane_offset, gpointer *out, GQueue *import_list);
 static void gst_vspm_filter_release_fd (GQueue *import_list);
 static void gst_vspm_filter_compute_csc (guint              src_fmt,
                                          GstVideoColorRange in_range,
@@ -154,14 +156,157 @@ enum
 {
   PROP_0,
   PROP_VSPM_OUTBUF,
+  PROP_VSPM_INBUF,
   PROP_VSPM_DMABUF,
   PROP_VSPM_CROP
 };
 
 static void
+gst_vspm_filter_free_buffer (VspmBuffer * buf)
+{
+  gint plane;
+
+  if (buf == NULL)
+    return;
+
+  for (plane = 0; plane < GST_VIDEO_MAX_PLANES; plane++) {
+    if (buf->dmabuf_pid[plane] >= 0) {
+      mmngr_export_end_in_user (buf->dmabuf_pid[plane]);
+      buf->dmabuf_pid[plane] = -1;
+    }
+  }
+  if (buf->mmng_pid >= 0) {
+    mmngr_free_in_user (buf->mmng_pid);
+    buf->mmng_pid = -1;
+  }
+}
+
+static void
+gst_vspm_filter_free_pool (VspmBufferPool * vspm_pool, GstBufferPool ** gst_pool)
+{
+  if (vspm_pool != NULL) {
+    while (vspm_pool->used_count) {
+      gst_vspm_filter_free_buffer (&vspm_pool->buffers[vspm_pool->used_count - 1]);
+      vspm_pool->used_count--;
+    }
+  }
+
+  if (gst_pool != NULL && *gst_pool != NULL) {
+    if (gst_buffer_pool_is_active (*gst_pool))
+      gst_buffer_pool_set_active (*gst_pool, FALSE);
+    gst_object_unref (*gst_pool);
+    *gst_pool = NULL;
+  }
+}
+
+static GstFlowReturn
+gst_vspm_filter_alloc_buffer (GstVspmFilter * space, VspmBufferInfo * buf_info,
+    VspmBuffer * vspm_buf, GstBuffer ** gst_buf)
+{
+  GstBuffer *buf;
+  gint page_size = getpagesize();
+  guint plane;
+
+  if (buf_info->buf_size == 0) {
+    GST_ERROR_OBJECT (space, "buffer info not initialized");
+    return GST_FLOW_ERROR;
+  }
+
+  vspm_buf->mmng_pid = -1;
+  for (plane = 0; plane < GST_VIDEO_MAX_PLANES; plane++) {
+    vspm_buf->dmabuf_pid[plane] = -1;
+  }
+
+  if (R_MM_OK != mmngr_alloc_in_user (&vspm_buf->mmng_pid, buf_info->buf_size,
+          &vspm_buf->pphy_addr, &vspm_buf->phard_addr, &vspm_buf->puser_virt_addr,
+          MMNGR_VA_SUPPORT_CACHED)) {
+    GST_ERROR_OBJECT (space, "mmngr_alloc_in_user failed (%u bytes)",
+        buf_info->buf_size);
+    vspm_buf->mmng_pid = -1;
+    return GST_FLOW_ERROR;
+  }
+
+  buf = gst_buffer_new ();
+
+  for (plane = 0; plane < buf_info->n_planes; plane++) {
+    GstMemory *mem;
+
+    if (space->use_dmabuf) {
+      unsigned long plane_phys_addr = vspm_buf->phard_addr + buf_info->plane_offset[plane];
+      gint phys_page_offset  = plane_phys_addr & (page_size - 1);
+      gint page_aligned_size = GST_ROUND_UP_N (buf_info->plane_size[plane] + phys_page_offset,
+                                      page_size);
+      gint dmabuf_fd = -1;
+
+      if ((mmngr_export_start_in_user (&vspm_buf->dmabuf_pid[plane], page_aligned_size,
+              (unsigned long) GST_ROUND_DOWN_N (plane_phys_addr, page_size),
+              &dmabuf_fd) != R_MM_OK) || (dmabuf_fd < 0)) {
+        GST_ERROR_OBJECT (space,
+            "mmngr_export_start_in_user failed (plane %u, phys 0x%lx)",
+            plane, plane_phys_addr);
+        vspm_buf->dmabuf_pid[plane] = -1;
+        gst_buffer_unref (buf);
+        gst_vspm_filter_free_buffer (vspm_buf);
+        return GST_FLOW_ERROR;
+      }
+
+      mem = gst_dmabuf_allocator_alloc_with_flags (space->allocator, dmabuf_fd,
+          page_aligned_size, GST_FD_MEMORY_FLAG_DONT_CLOSE);
+      if (mem == NULL) {
+        GST_ERROR_OBJECT (space, "gst_dmabuf_allocator_alloc failed");
+        gst_buffer_unref (buf);
+        gst_vspm_filter_free_buffer (vspm_buf);
+        return GST_FLOW_ERROR;
+      }
+      mem->offset = phys_page_offset;
+      mem->size = buf_info->plane_size[plane];
+    } else {
+      mem = gst_memory_new_wrapped (0,
+          (gpointer) (vspm_buf->puser_virt_addr + buf_info->plane_offset[plane]),
+          buf_info->plane_size[plane], 0, buf_info->plane_size[plane], NULL, NULL);
+      if (mem == NULL) {
+        GST_ERROR_OBJECT (space, "gst_memory_new_wrapped failed");
+        gst_buffer_unref (buf);
+        gst_vspm_filter_free_buffer (vspm_buf);
+        return GST_FLOW_ERROR;
+      }
+    }
+    gst_buffer_append_memory (buf, mem);
+  }
+
+  gst_buffer_add_video_meta_full (buf, GST_VIDEO_FRAME_FLAG_NONE,
+      buf_info->format, buf_info->width, buf_info->height,
+      buf_info->n_planes, buf_info->plane_offset, buf_info->plane_stride);
+
+  *gst_buf = buf;
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn
+gst_vspm_filter_allocate_port_buffer (GstVspmFilter * space, VspmBufferPool * vspm_pool,
+    VspmBufferInfo * buf_info, GstBuffer ** buffer)
+{
+  GstFlowReturn ret;
+
+  if (vspm_pool->used_count >=
+          (gint) (sizeof (vspm_pool->buffers) / sizeof (vspm_pool->buffers[0]))) {
+    GST_ERROR_OBJECT (space, "buffer pool exhausted (max %u)",
+        (guint) (sizeof (vspm_pool->buffers) / sizeof (vspm_pool->buffers[0])));
+    return GST_FLOW_ERROR;
+  }
+
+  ret = gst_vspm_filter_alloc_buffer (space, buf_info,
+      &vspm_pool->buffers[vspm_pool->used_count], buffer);
+  if (ret == GST_FLOW_OK)
+    vspm_pool->used_count++;
+
+  return ret;
+}
+
+static void
 gst_vspmfilter_buffer_pool_free_buffer (GstBufferPool * bpool, GstBuffer * buffer)
 {
-  /* No processing */
+  gst_buffer_unref (buffer);
 }
 
 static GstFlowReturn
@@ -170,29 +315,24 @@ gst_vspmfilter_buffer_pool_alloc_buffer (GstBufferPool * bpool,
 {
   GstVspmFilterBufferPool *vspmfltpool = GST_VSPMFILTER_BUFFER_POOL_CAST (bpool);
   GstVspmFilter * vspmfilter = vspmfltpool->vspmfilter;
-  GstBuffer *tmp;
-  GstFlowReturn result = GST_FLOW_OK;
-  VspmbufArray *vspm_outbuf;
 
-  vspm_outbuf = vspmfilter->vspm_outbuf;
-  tmp = g_ptr_array_index (vspm_outbuf->buf_array, vspm_outbuf->current_buffer_index);
-  *buffer = tmp;
+  if (vspmfltpool->is_input)
+    return gst_vspm_filter_allocate_port_buffer (vspmfilter,
+        vspmfilter->in_vspm_pool, &vspmfilter->in_buf_info, buffer);
 
-  vspm_outbuf->current_buffer_index ++;
-  if(vspm_outbuf->current_buffer_index >= vspm_outbuf->buf_array->len)
-      vspm_outbuf->current_buffer_index = 0;
-
-  return result;
+  return gst_vspm_filter_allocate_port_buffer (vspmfilter,
+      vspmfilter->out_vspm_pool, &vspmfilter->out_buf_info, buffer);
 }
 
 static GstBufferPool *
-gst_vspmfilter_buffer_pool_new (GstVspmFilter * vspmfilter)
+gst_vspmfilter_buffer_pool_new (GstVspmFilter * vspmfilter, gboolean is_input)
 {
   GstVspmFilterBufferPool *pool;
 
   g_return_val_if_fail (GST_IS_VIDEO_CONVERT(vspmfilter), NULL);
   pool = g_object_new (GST_TYPE_VSPMFILTER_BUFFER_POOL, NULL);
   pool->vspmfilter = gst_object_ref (vspmfilter);
+  pool->is_input = is_input;
 
   GST_LOG_OBJECT (pool, "new vspmfilter buffer pool %p", pool);
 
@@ -487,11 +627,15 @@ set_colorspace_output (GstVideoFormat vid_fmt, guint * format, guint * fswap)
 }
 
 static void
-gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
+gst_vspm_filter_set_buffer_info (GstVspmFilter * space, VspmBufferInfo * buf_info,
     GstVideoInfo * info, GstVideoAlignment * align)
 {
-  VspmBufferInfo *buf_info = &space->buf_info;
   gint i;
+
+  if (!buf_info) {
+    GST_ERROR_OBJECT (space, "buf_info is NULL");
+    return;
+  }
 
   if (info != NULL) {
     buf_info->width = GST_VIDEO_INFO_WIDTH (info);
@@ -508,7 +652,7 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
     }
   }
 
-  buf_info->outbuf_size = 0;
+  buf_info->buf_size = 0;
   memset (buf_info->plane_stride, 0, sizeof (buf_info->plane_stride));
   memset (buf_info->plane_size  , 0, sizeof (buf_info->plane_size));
   memset (buf_info->plane_offset, 0, sizeof (buf_info->plane_offset));
@@ -525,7 +669,7 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
     }
 #endif
 
-    buf_info->plane_offset[i] = buf_info->outbuf_size;
+    buf_info->plane_offset[i] = buf_info->buf_size;
 
     if (i == GST_VIDEO_COMP_Y) {
       /* If we have alignment requirement from downstream */
@@ -565,142 +709,19 @@ gst_vspm_filter_set_buffer_info (GstVspmFilter * space,
     buf_info->plane_stride[i] = stride;
     buf_info->plane_size[i] = stride * sliceheight;
 
-    buf_info->outbuf_size += buf_info->plane_size[i];
+    buf_info->buf_size += buf_info->plane_size[i];
   }
   return;
 }
 
-static GstFlowReturn
-gst_vspm_filter_allocate_buffer (GstVspmFilter * space)
-{
-  VspmBufferInfo *buf_info;
-  Vspm_mmng_ar *vspm_out;
-  VspmbufArray *vspm_outbuf;
-  gint vspm_used;
-  guint i, j;
-  gint page_size;
-  gint dmabuf_fd[GST_VIDEO_MAX_PLANES] = { 0, };
-  gint dmabuf_page_offset[GST_VIDEO_MAX_PLANES];
-  gint dmabuf_plane_size_ext[GST_VIDEO_MAX_PLANES];;
-
-  buf_info = &space->buf_info;
-  vspm_out = space->vspm_out;
-  vspm_outbuf = space->vspm_outbuf;
-  page_size = getpagesize();
-
-  for (i = 0; i < MAX_BUFFERS; i++) {
-    GstBuffer *buf;
-    vspm_used = vspm_out->used;
-    if (R_MM_OK == mmngr_alloc_in_user(&vspm_out->vspm[vspm_used].mmng_pid,
-                                       buf_info->outbuf_size,
-                                       &vspm_out->vspm[vspm_used].pphy_addr,
-                                       &vspm_out->vspm[vspm_used].phard_addr,
-                                       &vspm_out->vspm[vspm_used].puser_virt_addr,
-                                       MMNGR_VA_SUPPORT_CACHED)) {
-      vspm_out->used++;
-      if (space->use_dmabuf) {
-        buf = gst_buffer_new ();
-        for (j = 0; j < buf_info->n_planes; j++) {
-          gint res;
-          guint phys_addr;
-          GstMemory *mem;
-          phys_addr = (guint)vspm_out->vspm[vspm_used].phard_addr +
-                      buf_info->plane_offset[j];
-          /* Calculate offset between physical address and page boundary */
-          dmabuf_page_offset[j] = phys_addr & (page_size - 1);
-          /* When downstream plugins do mapping from dmabuf fd it requires
-          * mapping from boundary page and size align for page size so
-          * memory for plane must increase to handle for this case */
-          dmabuf_plane_size_ext[j] = GST_ROUND_UP_N(
-              buf_info->plane_size[j] + dmabuf_page_offset[j], page_size);
-          res = mmngr_export_start_in_user (&vspm_out->vspm[vspm_used].dmabuf_pid[j],
-                                            dmabuf_plane_size_ext[j],
-                                            (unsigned long) GST_ROUND_DOWN_N(phys_addr, page_size),
-					    &dmabuf_fd[j]);
-          if (res != R_MM_OK) {
-            GST_ERROR_OBJECT (space,
-              "mmngr_export_start_in_user failed (phys_addr:0x%08x)",
-              phys_addr);
-            return GST_FLOW_ERROR;
-          }
-
-          /* Set offset's information */
-          mem = gst_dmabuf_allocator_alloc (space->allocator, dmabuf_fd[j],
-                                            dmabuf_plane_size_ext[j]);
-          mem->offset = dmabuf_page_offset[j];
-          /* Only allow to access plane size */
-          mem->size = buf_info->plane_size[j];
-          gst_buffer_append_memory (buf, mem);
-        }
-      } else {
-        buf = gst_buffer_new_wrapped (
-                (gpointer)vspm_out->vspm[vspm_used].puser_virt_addr,
-                (gsize)buf_info->outbuf_size);
-      }
-    } else {
-      GST_ERROR_OBJECT (space,
-            "mmngr_alloc_in_user failed to allocate memory (%d)",
-            buf_info->outbuf_size);
-      return GST_FLOW_ERROR;
-    }
-
-    g_ptr_array_add (vspm_outbuf->buf_array, buf);
-    gst_buffer_add_video_meta_full(buf, GST_VIDEO_FRAME_FLAG_NONE,
-                                   buf_info->format,
-                                   buf_info->width, buf_info->height,
-                                   buf_info->n_planes,
-                                   buf_info->plane_offset, buf_info->plane_stride);
-  }
-
-  return GST_FLOW_OK;
-}
-
 static void
-gst_vspm_filter_free_buffer (GstVspmFilter * space)
+gst_vspm_filter_free_buffer_pools (GstVspmFilter * space)
 {
-  VspmBufferInfo *buf_info;
-  Vspm_mmng_ar *vspm_in, *vspm_out;
-  gint i, vspm_used;
-  VspmbufArray *vspm_outbuf;
-
-  vspm_in = space->vspm_in;
-  vspm_out = space->vspm_out;
-  vspm_outbuf = space->vspm_outbuf;
-
-  if (vspm_outbuf->buf_array->len > 0) {
-    g_ptr_array_remove_index(vspm_outbuf->buf_array,
-                             vspm_outbuf->buf_array->len - 1);
-  }
-
   /* Release the importing to avoid leak FD */
   gst_vspm_filter_release_fd (space->mmngr_import_list);
 
-  while (vspm_in->used) {
-    vspm_used = vspm_in->used - 1;
-
-    for (i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
-      if(vspm_in->vspm[vspm_used].dmabuf_pid[i] >= 0) {
-        mmngr_import_end_in_user(vspm_in->vspm[vspm_used].dmabuf_pid[i]);
-      }
-    }
-
-    vspm_in->used--;
-  }
-
-  while (vspm_out->used) {
-    vspm_used = vspm_out->used - 1;
-
-    for (i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
-      if (vspm_out->vspm[vspm_used].dmabuf_pid[i] >= 0) {
-        mmngr_export_end_in_user(vspm_out->vspm[vspm_used].dmabuf_pid[i]);
-      }
-    }
-
-    if (vspm_out->vspm[vspm_used].mmng_pid >= 0) {
-      mmngr_free_in_user(vspm_out->vspm[vspm_used].mmng_pid);
-    }
-    vspm_out->used--;
-  }
+  gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
+  gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
 }
 
 static gboolean
@@ -711,7 +732,6 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
   GstVspmFilter *space;
   GstVspmFilterVspInfo *vsp_info;
   GstStructure *structure;
-  gint i;
 
   space = GST_VIDEO_CONVERT_CAST (filter);
   vsp_info = space->vsp_info;
@@ -783,24 +803,50 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
   }
 
   if(space->outbuf_allocate) {
-    gst_vspm_filter_set_buffer_info (space, out_info, NULL);
+    gst_vspm_filter_set_buffer_info (space, &space->out_buf_info, out_info, NULL);
 
-    if (space->out_port_pool) {
-      if (gst_buffer_pool_is_active (space->out_port_pool))
-        gst_buffer_pool_set_active (space->out_port_pool, FALSE);
-      gst_object_unref (space->out_port_pool);
-    }
+    /* Drop any pool from a previous negotiation so we never hand out
+     * buffers sized for stale caps after a resolution change. */
+    gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
 
     /* create a new buffer pool*/
-    space->out_port_pool = gst_vspmfilter_buffer_pool_new (space);
+    space->out_gst_pool = gst_vspmfilter_buffer_pool_new (space, FALSE);
 
-    structure = gst_buffer_pool_get_config (space->out_port_pool);
+    structure = gst_buffer_pool_get_config (space->out_gst_pool);
     gst_buffer_pool_config_set_params(structure, outcaps,
-                                      space->buf_info.outbuf_size,
+                                      space->out_buf_info.buf_size,
                                       MIN_BUFFERS, MAX_BUFFERS);
-    if (!gst_buffer_pool_set_config (space->out_port_pool, structure)) {
-      GST_WARNING_OBJECT (space, "failed to set buffer pool configuration");
+    if (!gst_buffer_pool_set_config (space->out_gst_pool, structure)) {
+      GST_WARNING_OBJECT (space, "failed to configure output buffer pool");
     }
+  } else {
+    /* outbuf-alloc turned off (or never on): make sure no stale pool lingers */
+    gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
+  }
+
+  if (space->inbuf_allocate) {
+    gst_vspm_filter_set_buffer_info (space, &space->in_buf_info, in_info, NULL);
+
+    /* Drop any pool from a previous negotiation so we never hand out
+     * buffers sized for stale caps after a resolution change. */
+    gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
+
+    space->in_gst_pool = gst_vspmfilter_buffer_pool_new (space, TRUE);
+
+    structure = gst_buffer_pool_get_config (space->in_gst_pool);
+    /* Let upstream decide the number of buffers it needs */
+    gst_buffer_pool_config_set_params (structure, incaps,
+        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+    /* VIDEO_META lets upstream accept our ISU-aligned stride/offset
+     * without padding or an extra copy. */
+    gst_buffer_pool_config_add_option (structure,
+        GST_BUFFER_POOL_OPTION_VIDEO_META);
+    if (!gst_buffer_pool_set_config (space->in_gst_pool, structure)) {
+      GST_WARNING_OBJECT (space, "failed to configure input buffer pool");
+    }
+  } else {
+    /* inbuf-alloc turned off (or never on): make sure no stale pool lingers */
+    gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
   }
 
   return TRUE;
@@ -837,7 +883,7 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
           /* Get alignment */
           gst_video_alignment_reset(&align);
           gst_buffer_pool_config_get_video_alignment(config, &align);
-
+          gst_structure_free(config);
           /* FIXME: Currently, we ignore padding and only check stride */
           GST_DEBUG_OBJECT(space, "got a stride alignment requirement from "
                                   "downstream %d:%d:%d:%d",
@@ -846,12 +892,13 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
 
           for (i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
             if ((align.stride_align[i] != 0) &&
-                (space->buf_info.plane_stride[i] % align.stride_align[i] != 0)) {
+                (space->out_buf_info.plane_stride[i] % align.stride_align[i] != 0)) {
               update = TRUE;
               break;
             }
           }
         }
+        gst_object_unref(pool);
       }
     }
 
@@ -861,22 +908,22 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
 
       GST_DEBUG_OBJECT(space, "update buffer info and buffer pool");
 
-      if (space->out_port_pool) {
-        if (gst_buffer_pool_is_active (space->out_port_pool)) {
-          gst_buffer_pool_set_active (space->out_port_pool, FALSE);
+      if (space->out_gst_pool) {
+        if (gst_buffer_pool_is_active (space->out_gst_pool)) {
+          gst_buffer_pool_set_active (space->out_gst_pool, FALSE);
         }
       }
 
-      gst_vspm_filter_set_buffer_info (space, NULL, &align);
+      gst_vspm_filter_set_buffer_info (space, &space->out_buf_info, NULL, &align);
 
-      structure = gst_buffer_pool_get_config (space->out_port_pool);
+      structure = gst_buffer_pool_get_config (space->out_gst_pool);
       gst_buffer_pool_config_get_params(structure, &caps, NULL, NULL, NULL);
 
       gst_buffer_pool_config_set_params(structure, caps,
-                                        space->buf_info.outbuf_size,
+                                        space->out_buf_info.buf_size,
                                         MIN_BUFFERS, MAX_BUFFERS);
 
-      if (!gst_buffer_pool_set_config (space->out_port_pool, structure)) {
+      if (!gst_buffer_pool_set_config (space->out_gst_pool, structure)) {
         GST_WARNING_OBJECT (space, "failed to set buffer pool configuration");
       }
     }
@@ -885,18 +932,50 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
   return TRUE;
 }
 
+static gboolean
+gst_vspm_filter_propose_allocation (GstBaseTransform * trans,
+    GstQuery * decide_query, GstQuery * query)
+{
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
+
+  if (!GST_BASE_TRANSFORM_CLASS (parent_class)->propose_allocation (trans,
+          decide_query, query))
+    return FALSE;
+
+  if (space->inbuf_allocate || space->outbuf_allocate)
+    gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+
+  /* Only propose our own input pool when we actually allocate input buffers. */
+  if (!space->inbuf_allocate)
+    return TRUE;
+
+  if (space->in_gst_pool == NULL) {
+    GST_DEBUG_OBJECT (space,
+        "input pool not ready, upstream will use its own allocator");
+    return TRUE;
+  }
+
+  /* Let upstream decide the number of buffers it needs */
+  if (gst_query_get_n_allocation_pools (query) > 0)
+    gst_query_set_nth_allocation_pool (query, 0, space->in_gst_pool,
+        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+  else
+    gst_query_add_allocation_pool (query, space->in_gst_pool,
+        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+
+  GST_DEBUG_OBJECT (space,
+      "proposed input pool=%p size=%u min=%d max=%d",
+      space->in_gst_pool, space->in_buf_info.buf_size,
+      MIN_BUFFERS, 0);
+
+  return TRUE;
+}
+
 static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * trans,
                                           GstBuffer *inbuf, GstBuffer **outbuf)
 {
     GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
-    GstBuffer *buf;
-    guint n_mem,i;
     GstFlowReturn ret = GST_FLOW_OK;
-    Vspm_mmng_ar *vspm_out;
-    VspmbufArray *vspm_outbuf;
-
-    vspm_out    = space->vspm_out;
-    vspm_outbuf = space->vspm_outbuf;
 
     gboolean base_passthrough = gst_base_transform_is_passthrough (trans);
     gboolean do_passthrough   = base_passthrough &&
@@ -908,22 +987,18 @@ static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * t
     }
 
     if(space->outbuf_allocate) {
-      trans->priv->passthrough = 0; //disable pass-through mode
+      gst_base_transform_set_passthrough (trans, FALSE);
 
-      /* Allocate buffer and buffer pool */
-      if (space->vspm_out->used == 0) {
-        ret = gst_vspm_filter_allocate_buffer(space);
-        if (ret != GST_FLOW_OK) {
-          return ret;
-        } else {
-          if (!gst_buffer_pool_is_active(space->out_port_pool)) {
-            if (!gst_buffer_pool_set_active(space->out_port_pool, TRUE))
-              GST_WARNING_OBJECT(space, "failed to activate buffer pool");
-          }
+      if (!gst_buffer_pool_is_active (space->out_gst_pool)) {
+        if (!gst_buffer_pool_set_active (space->out_gst_pool, TRUE)) {
+          GST_ERROR_OBJECT (space, "failed to activate output buffer pool");
+          return GST_FLOW_ERROR;
         }
       }
 
-      ret = gst_buffer_pool_acquire_buffer(space->out_port_pool, outbuf, NULL);
+      ret = gst_buffer_pool_acquire_buffer (space->out_gst_pool, outbuf, NULL);
+      if (ret != GST_FLOW_OK)
+        return ret;
 
       if(gst_buffer_is_writable(*outbuf)) {
         if (!GST_BASE_TRANSFORM_CLASS(parent_class)->copy_metadata (trans,
@@ -948,16 +1023,13 @@ gst_vspmfilter_change_state (GstElement * element, GstStateChange transition)
 
   switch (transition) {
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      if (space->out_port_pool)
-        gst_buffer_pool_set_active (space->out_port_pool, FALSE);
+      if (space->out_gst_pool)
+        gst_buffer_pool_set_active (space->out_gst_pool, FALSE);
+      if (space->in_gst_pool)
+        gst_buffer_pool_set_active (space->in_gst_pool, FALSE);
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
-      if (space->out_port_pool) {
-        gst_object_unref (space->out_port_pool);
-        space->out_port_pool = NULL;
-      }
-      /* Release the importing to avoid leak FD */
-      gst_vspm_filter_release_fd (space->mmngr_import_list);
+      gst_vspm_filter_free_buffer_pools (space);
       break;
     default:
       break;
@@ -1033,6 +1105,10 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
       g_param_spec_boolean ("outbuf-alloc", "Use outbuf-alloc mode",
         "Whether or not to self-allocate output buffer",
         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_VSPM_INBUF,
+      g_param_spec_boolean ("inbuf-alloc", "Use inbuf-alloc mode",
+        "Whether or not to self-allocate input buffer",
+        FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_VSPM_DMABUF,
       g_param_spec_boolean ("dmabuf-use", "Use DMABUF mode",
         "Whether or not to use dmabuf for output buffer",
@@ -1058,6 +1134,8 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
       GST_DEBUG_FUNCPTR (gst_vspm_filter_prepare_output_buffer);
   gstbasetransform_class->decide_allocation =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_decide_allocation);
+  gstbasetransform_class->propose_allocation =
+      GST_DEBUG_FUNCPTR (gst_vspm_filter_propose_allocation);
   gstvideofilter_class->set_info =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_set_info);
   gstvideofilter_class->transform_frame =
@@ -1069,12 +1147,8 @@ gst_vspm_filter_finalize (GObject * obj)
 {
   GstVspmFilter *space = GST_VIDEO_CONVERT (obj);
   GstVspmFilterVspInfo *vsp_info;
-  Vspm_mmng_ar *vspm_in;
-  Vspm_mmng_ar *vspm_out;
 
   vsp_info = space->vsp_info;
-  vspm_in = space->vspm_in;
-  vspm_out = space->vspm_out;
 
   if (vsp_info->mmngr_fd != -1) {
     /* mmngr dev close */
@@ -1086,8 +1160,9 @@ gst_vspm_filter_finalize (GObject * obj)
     VSPM_lib_DriverQuit(vsp_info->vspm_handle);
   }
 
-  if (vspm_in->used || vspm_out->used)
-    gst_vspm_filter_free_buffer (space);
+  /* Release any buffer resources left over if teardown did not go through
+   * change_state (imported fds, both ports' buffers + pools). */
+  gst_vspm_filter_free_buffer_pools (space);
 
   if (space->vsp_info) {
     g_free (vsp_info->cached_csc);
@@ -1095,15 +1170,10 @@ gst_vspm_filter_finalize (GObject * obj)
   }
   if (space->mmngr_import_list)
     g_queue_free (space->mmngr_import_list);
-  if (space->vspm_in)
-    g_free (space->vspm_in);
-  /* free buf_array when finalize */
-  if (space->vspm_outbuf->buf_array)
-    g_ptr_array_free(space->vspm_outbuf->buf_array, TRUE);
-  if (space->vspm_out)
-    g_free (space->vspm_out);
-  if (space->vspm_outbuf)
-    g_free (space->vspm_outbuf);
+  if (space->in_vspm_pool)
+    g_free (space->in_vspm_pool);
+  if (space->out_vspm_pool)
+    g_free (space->out_vspm_pool);
   /* free space->allocator when finalize */
   if (space->allocator)
     gst_object_unref(space->allocator);
@@ -1117,54 +1187,49 @@ static void
 gst_vspm_filter_init (GstVspmFilter * space)
 {
   GstVspmFilterVspInfo *vsp_info;
-  Vspm_mmng_ar *vspm_in;
-  Vspm_mmng_ar *vspm_out;
-  VspmbufArray *vspm_outbuf;
-  guint i, j;
+  VspmBufferPool *in_vspm_pool;
+  VspmBufferPool *out_vspm_pool;
 
-  space->vsp_info = g_malloc0 (sizeof (GstVspmFilterVspInfo));
-  space->vspm_in = g_malloc0 (sizeof (Vspm_mmng_ar));
-  space->vspm_out = g_malloc0 (sizeof (Vspm_mmng_ar));
-  space->vspm_outbuf = g_malloc0 (sizeof (VspmbufArray));
-  if (!space->vsp_info 
-    || !space->vspm_in 
-    || !space->vspm_out
-    || !space->vspm_outbuf) {
+  space->vsp_info      = g_malloc0 (sizeof (GstVspmFilterVspInfo));
+  space->in_vspm_pool  = g_malloc0 (sizeof (VspmBufferPool));
+  space->out_vspm_pool = g_malloc0 (sizeof (VspmBufferPool));
+  if (!space->vsp_info
+    || !space->in_vspm_pool
+    || !space->out_vspm_pool) {
     GST_ELEMENT_ERROR (space, RESOURCE, NO_SPACE_LEFT,
         ("Could not allocate vsp info"), ("Could not allocate vsp info"));
     return;
   }
 
-  vsp_info = space->vsp_info;
-  vspm_in = space->vspm_in;
-  vspm_out = space->vspm_out;
-  vspm_outbuf = space->vspm_outbuf;
+  vsp_info      = space->vsp_info;
+  in_vspm_pool  = space->in_vspm_pool;
+  out_vspm_pool = space->out_vspm_pool;
 
   vsp_info->is_init_vspm = FALSE;
-  vsp_info->format_flag = 0;
-  vsp_info->mmngr_fd = -1;
-  vsp_info->cached_csc = NULL;
+  vsp_info->format_flag  = 0;
+  vsp_info->mmngr_fd     = -1;
+  vsp_info->cached_csc   = NULL;
   /* mmngr dev open */
   vsp_info->mmngr_fd = open(DEVFILE, O_RDWR);
   if (vsp_info->mmngr_fd == -1) {
     GST_ERROR ("MMNGR: open error. \n");
   }
-  
+
   if (VSPM_lib_DriverInitialize(&vsp_info->vspm_handle) == R_VSPM_OK) {
     vsp_info->is_init_vspm = TRUE;
   } else {
     GST_ERROR ("VSPM: Error Initialized. \n");
   }
 
-  vspm_in->used = 0;
-  vspm_out->used = 0;
-  vspm_outbuf->buf_array = g_ptr_array_new ();  
-  vspm_outbuf->current_buffer_index = 0;
-  space->allocator = gst_dmabuf_allocator_new ();
-  space->outbuf_allocate = FALSE;
-  space->use_dmabuf = FALSE;
-  space->first_buff = 1;
-  space->mmngr_import_list = g_queue_new ();
+  in_vspm_pool->used_count  = 0;
+  out_vspm_pool->used_count = 0;
+  space->allocator          = gst_dmabuf_allocator_new ();
+  space->outbuf_allocate    = FALSE;
+  space->inbuf_allocate     = FALSE;
+  space->in_gst_pool        = NULL;
+  space->out_gst_pool       = NULL;
+  space->use_dmabuf         = FALSE;
+  space->mmngr_import_list  = g_queue_new ();
 
   /* Initialize crop to disabled */
   space->crop.left   = 0;
@@ -1172,15 +1237,6 @@ gst_vspm_filter_init (GstVspmFilter * space)
   space->crop.top    = 0;
   space->crop.bottom = 0;
   space->enable_crop = FALSE;
-
-  for (i = 0; i < sizeof(vspm_in->vspm)/sizeof(vspm_in->vspm[0]); i++) {
-    for (j = 0; j < GST_VIDEO_MAX_PLANES; j++)
-      vspm_in->vspm[i].dmabuf_pid[j] = -1;
-  }
-  for (i = 0; i < sizeof(vspm_out->vspm)/sizeof(vspm_out->vspm[0]); i++) {
-    for (j = 0; j < GST_VIDEO_MAX_PLANES; j++)
-      vspm_out->vspm[i].dmabuf_pid[j] = -1;
-  }
 
   sem_init (&space->smp_wait, 0, 0);
 }
@@ -1240,6 +1296,9 @@ gst_vspm_filter_set_property (GObject * object, guint property_id,
     case PROP_VSPM_OUTBUF:
       space->outbuf_allocate = g_value_get_boolean (value);
       break;
+    case PROP_VSPM_INBUF:
+      space->inbuf_allocate = g_value_get_boolean (value);
+      break;
     case PROP_VSPM_DMABUF:
       space->use_dmabuf = g_value_get_boolean (value);
       if (space->use_dmabuf)
@@ -1262,6 +1321,9 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
   switch (property_id) {
     case PROP_VSPM_OUTBUF:
       g_value_set_boolean (value, space->outbuf_allocate);
+      break;
+    case PROP_VSPM_INBUF:
+      g_value_set_boolean (value, space->inbuf_allocate);
       break;
     case PROP_VSPM_DMABUF:
       g_value_set_boolean (value, space->use_dmabuf);
@@ -1394,7 +1456,7 @@ gst_vspm_filter_mem_is_contiguous (GstVspmFilter * space, GstBuffer * buf,
 static gboolean
 gst_vspm_filter_buffer_layout_matches (GstVspmFilter * space, GstBuffer * buf)
 {
-  VspmBufferInfo *outbuf_info = &space->buf_info;
+  VspmBufferInfo *outbuf_info = &space->out_buf_info;
   GstVideoInfo *in_info = &GST_VIDEO_FILTER (space)->in_info;
   GstVideoMeta *vmeta = gst_buffer_get_video_meta (buf);
   guint plane, n_planes = outbuf_info->n_planes;
@@ -1444,18 +1506,23 @@ gst_vspm_filter_buffer_can_passthrough (GstVspmFilter * space, GstBuffer * buf)
 }
 
 static void
-gst_vspm_filter_import_fd (GstMemory *mem, gpointer *out, GQueue *import_list)
+gst_vspm_filter_import_fd (GstMemory *mem, gsize plane_offset, gpointer *out,
+    GQueue *import_list)
 {
   int fd;
 
   if (gst_is_dmabuf_memory(mem)) {
     int import_pid;
     size_t size;
+    unsigned int phys_base = 0;
 
     fd = gst_dmabuf_memory_get_fd (mem);
-    if (R_MM_OK == mmngr_import_start_in_user_ext (&import_pid,
-                                                   &size, (unsigned int *)out,
-                                                   fd, NULL)) {
+    if (R_MM_OK == mmngr_import_start_in_user_ext (&import_pid, &size,
+                                                   &phys_base, fd, NULL)) {
+      /* import returns the page-aligned base of the dmabuf; the plane data
+       * starts at mem->offset + the plane's byte offset within the buffer
+       * (non-zero for packed multi-plane formats sharing one dmabuf) */
+      *out = (gpointer) ((unsigned long) phys_base + mem->offset + plane_offset);
       g_queue_push_tail (import_list, GINT_TO_POINTER(import_pid));
     }
   }
@@ -1698,6 +1765,41 @@ gst_vspm_filter_compute_csc (guint              src_fmt,
 }
 
 static GstFlowReturn
+gst_vspm_filter_get_mem_phys_addr (GstVspmFilter * space, GstBuffer * buf,
+    gpointer vir_addr, guint plane, gsize plane_offset, gpointer * out_phy)
+{
+  GstMemory *mem = NULL;
+  guint n_mem;
+  guint mem_idx;
+  gsize offs;
+
+  *out_phy = NULL;
+
+  if (!buf)
+    return GST_FLOW_ERROR;
+
+  find_physical_address (space, vir_addr, out_phy);
+  if (*out_phy != NULL)
+    return GST_FLOW_OK;
+
+  /* A single memory packs all planes (use memory 0 at the plane's byte offset);
+   * otherwise there is one memory per plane, each starting at its own base. */
+  n_mem   = gst_buffer_n_memory (buf);
+  mem_idx = (n_mem == 1) ? 0 : plane;
+  offs    = (n_mem == 1) ? plane_offset : 0;
+
+  if (mem_idx < n_mem)
+    mem = gst_buffer_peek_memory (buf, mem_idx);
+  if (mem != NULL) {
+    gst_vspm_filter_import_fd (mem, offs, out_phy, space->mmngr_import_list);
+    if (*out_phy != NULL)
+      return GST_FLOW_OK;
+  }
+
+  return GST_FLOW_ERROR;
+}
+
+static GstFlowReturn
 gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame)
 {
@@ -1727,8 +1829,6 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   void *src_addr[3] = { 0 };
   void *dst_addr[3] = { 0 };
   guint in_n_planes, out_n_planes;
-  GstBuffer *buf;
-  GstMemory *mem;
 
   space = GST_VIDEO_CONVERT_CAST (filter);
   vsp_info = space->vsp_info;
@@ -1774,51 +1874,37 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   in_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_in_vinfo);
   out_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_out_vinfo);
 
-  ret = find_physical_address (space, in_frame->data[0],  &src_addr[0]);
-  if (!src_addr[0] || ret) {
-    buf = in_frame->buffer;
-    mem = gst_buffer_peek_memory (buf, 0);
-    gst_vspm_filter_import_fd (mem, &src_addr[0], space->mmngr_import_list);
+  if (gst_vspm_filter_get_mem_phys_addr (space, in_frame->buffer,
+          in_frame->data[0], 0, in_frame->info.offset[0], &src_addr[0]) != GST_FLOW_OK) {
+    GST_ERROR_OBJECT (space, "no physical address for input plane 0");
+    ret = GST_FLOW_ERROR;
+    goto err;
   }
 
-  ret = find_physical_address (space, out_frame->data[0],  &dst_addr[0]);
-  if (!dst_addr[0] || ret) {
-    buf = out_frame->buffer;
-    mem = gst_buffer_peek_memory (buf, 0);
-    gst_vspm_filter_import_fd (mem, &dst_addr[0], space->mmngr_import_list);
+  if (gst_vspm_filter_get_mem_phys_addr (space, out_frame->buffer,
+          out_frame->data[0], 0, out_frame->info.offset[0], &dst_addr[0]) != GST_FLOW_OK) {
+    GST_ERROR_OBJECT (space, "no physical address for output plane 0");
+    ret = GST_FLOW_ERROR;
+    goto err;
   }
 
   if (in_n_planes >= 2) {
-    ret = find_physical_address (space, in_frame->data[1],  &src_addr[1]);
-    if (!src_addr[1] || ret) {
-      buf = in_frame->buffer;
-      if (gst_buffer_n_memory(buf) > 1) {
-        /* Make sure we have separate GstMemory for each planar */
-        mem = gst_buffer_peek_memory (buf, 1);
-        gst_vspm_filter_import_fd (mem, &src_addr[1], space->mmngr_import_list);
-      } else {
-        /* We can not find the exactly address for plane 2, return as error */
-        GST_ERROR("Can not find physical address of input buffer for planar 2\n");
-        ret = GST_FLOW_ERROR;
-        goto err;
-      }
+    if (gst_vspm_filter_get_mem_phys_addr (space, in_frame->buffer,
+            in_frame->data[1], 1, in_frame->info.offset[1], &src_addr[1]) != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (space,
+          "no physical address for input plane 1");
+      ret = GST_FLOW_ERROR;
+      goto err;
     }
   }
 
   if (out_n_planes >= 2) {
-    ret = find_physical_address (space, out_frame->data[1],  &dst_addr[1]);
-    if (!dst_addr[1] || ret) {
-      buf = out_frame->buffer;
-      if (gst_buffer_n_memory(buf) > 1) {
-        /* Make sure we have separate GstMemory for each planar */
-        mem = gst_buffer_peek_memory (buf, 1);
-        gst_vspm_filter_import_fd (mem, &dst_addr[1], space->mmngr_import_list);
-      } else {
-        GST_ERROR("Can not find physical address of output buffer for planar 2\n");
-        /* We can not find the exactly address for plane 2, return as error */
-        ret = GST_FLOW_ERROR;
-        goto err;
-      }
+    if (gst_vspm_filter_get_mem_phys_addr (space, out_frame->buffer,
+            out_frame->data[1], 1, out_frame->info.offset[1], &dst_addr[1]) != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (space,
+          "no physical address for output plane 1");
+      ret = GST_FLOW_ERROR;
+      goto err;
     }
   }
 

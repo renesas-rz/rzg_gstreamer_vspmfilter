@@ -56,6 +56,10 @@ G_BEGIN_DECLS
 
 #define N_BUFFERS 1
 
+/* number buffers of buffer pool */
+#define MIN_BUFFERS (5)
+#define MAX_BUFFERS (32)
+
 #define MAX_DEVICES 2
 #define MAX_ENTITIES 4
 
@@ -93,6 +97,9 @@ struct _GstVspmFilterBufferPool
   GstVspmFilter *vspmfilter;
 
   GstCaps *caps;
+
+  /* TRUE if this pool serves input (upstream) buffers, FALSE for output */
+  gboolean is_input;
 };
 
 struct _GstVspmFilterBufferPoolClass
@@ -145,22 +152,15 @@ typedef struct {
   unsigned long pphy_addr;
   unsigned long phard_addr;
   unsigned long puser_virt_addr;
-  gint dmabuf_fd;
-  GstBuffer *buf;
-} Vspm_dmabuff;
+} VspmBuffer;
 
 typedef struct {
-  Vspm_dmabuff vspm[5];
-  int used;
-} Vspm_mmng_ar;
+  VspmBuffer buffers[MAX_BUFFERS];
+  int used_count;
+} VspmBufferPool;
 
 typedef struct {
-  GPtrArray *buf_array;
-  gint current_buffer_index;
-}VspmbufArray ;
-
-typedef struct {
-  guint outbuf_size;
+  guint buf_size;
   guint width;
   guint height;
   GstVideoFormat format;
@@ -185,13 +185,14 @@ struct _GstVspmFilter {
   GstAllocator *allocator;
   guint use_dmabuf;
   guint outbuf_allocate;
-  VspmBufferInfo buf_info;
-  GstBufferPool *in_port_pool, *out_port_pool;
-  Vspm_mmng_ar *vspm_in;
-  Vspm_mmng_ar *vspm_out;
-  VspmbufArray *vspm_outbuf;
+  guint inbuf_allocate;
+  VspmBufferInfo in_buf_info;
+  VspmBufferInfo out_buf_info;
+  GstBufferPool  *in_gst_pool;
+  GstBufferPool  *out_gst_pool;
+  VspmBufferPool *in_vspm_pool;
+  VspmBufferPool *out_vspm_pool;
   GQueue *mmngr_import_list;
-  gint first_buff;
   sem_t smp_wait;
   /* Crop parameters */
   struct {
