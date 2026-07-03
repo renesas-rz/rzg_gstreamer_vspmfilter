@@ -182,21 +182,27 @@ gst_vspm_filter_free_buffer (VspmBuffer * buf)
 }
 
 static void
-gst_vspm_filter_free_pool (VspmBufferPool * vspm_pool, GstBufferPool ** gst_pool)
+gst_vspm_filter_free_vspm_buffers (VspmBufferPool * vspm_pool)
 {
-  if (vspm_pool != NULL) {
-    while (vspm_pool->used_count) {
-      gst_vspm_filter_free_buffer (&vspm_pool->buffers[vspm_pool->used_count - 1]);
-      vspm_pool->used_count--;
-    }
+  while (vspm_pool->used_count) {
+    gst_vspm_filter_free_buffer (&vspm_pool->buffers[vspm_pool->used_count - 1]);
+    vspm_pool->used_count--;
   }
+}
 
-  if (gst_pool != NULL && *gst_pool != NULL) {
-    if (gst_buffer_pool_is_active (*gst_pool))
-      gst_buffer_pool_set_active (*gst_pool, FALSE);
-    gst_object_unref (*gst_pool);
-    *gst_pool = NULL;
-  }
+static void
+gst_vspm_filter_free_pool (GstBufferPool ** gst_pool)
+{
+  if (gst_pool == NULL || *gst_pool == NULL)
+    return;
+
+  gst_vspm_filter_free_vspm_buffers (
+      &GST_VSPMFILTER_BUFFER_POOL_CAST (*gst_pool)->vspm_pool);
+
+  if (gst_buffer_pool_is_active (*gst_pool))
+    gst_buffer_pool_set_active (*gst_pool, FALSE);
+  gst_object_unref (*gst_pool);
+  *gst_pool = NULL;
 }
 
 static GstFlowReturn
@@ -316,23 +322,18 @@ gst_vspmfilter_buffer_pool_alloc_buffer (GstBufferPool * bpool,
   GstVspmFilterBufferPool *vspmfltpool = GST_VSPMFILTER_BUFFER_POOL_CAST (bpool);
   GstVspmFilter * vspmfilter = vspmfltpool->vspmfilter;
 
-  if (vspmfltpool->is_input)
-    return gst_vspm_filter_allocate_port_buffer (vspmfilter,
-        vspmfilter->in_vspm_pool, &vspmfilter->in_buf_info, buffer);
-
   return gst_vspm_filter_allocate_port_buffer (vspmfilter,
-      vspmfilter->out_vspm_pool, &vspmfilter->out_buf_info, buffer);
+      &vspmfltpool->vspm_pool, &vspmfltpool->buf_info, buffer);
 }
 
 static GstBufferPool *
-gst_vspmfilter_buffer_pool_new (GstVspmFilter * vspmfilter, gboolean is_input)
+gst_vspmfilter_buffer_pool_new (GstVspmFilter * vspmfilter)
 {
   GstVspmFilterBufferPool *pool;
 
   g_return_val_if_fail (GST_IS_VIDEO_CONVERT(vspmfilter), NULL);
   pool = g_object_new (GST_TYPE_VSPMFILTER_BUFFER_POOL, NULL);
   pool->vspmfilter = gst_object_ref (vspmfilter);
-  pool->is_input = is_input;
 
   GST_LOG_OBJECT (pool, "new vspmfilter buffer pool %p", pool);
 
@@ -344,8 +345,9 @@ gst_vspmfilter_buffer_pool_finalize (GObject * object)
 {
   GstVspmFilterBufferPool *pool = GST_VSPMFILTER_BUFFER_POOL_CAST (object);
 
-  if (pool->caps)
-    gst_caps_unref (pool->caps);
+  /* Guarantees no fd/hw leak (no-op if already freed) */
+  gst_vspm_filter_free_vspm_buffers (&pool->vspm_pool);
+
   gst_object_unref (pool->vspmfilter);
 
   G_OBJECT_CLASS (gst_vspmfilter_buffer_pool_parent_class)->finalize (object);
@@ -720,8 +722,8 @@ gst_vspm_filter_free_buffer_pools (GstVspmFilter * space)
   /* Release the importing to avoid leak FD */
   gst_vspm_filter_release_fd (space->mmngr_import_list);
 
-  gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
-  gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
+  gst_vspm_filter_free_pool (&space->in_gst_pool);
+  gst_vspm_filter_free_pool (&space->out_gst_pool);
 }
 
 static gboolean
@@ -803,40 +805,48 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
   }
 
   if(space->outbuf_allocate) {
-    gst_vspm_filter_set_buffer_info (space, &space->out_buf_info, out_info, NULL);
+    VspmBufferInfo *out_buf_info;
 
     /* Drop any pool from a previous negotiation so we never hand out
      * buffers sized for stale caps after a resolution change. */
-    gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
+    gst_vspm_filter_free_pool (&space->out_gst_pool);
 
-    /* create a new buffer pool*/
-    space->out_gst_pool = gst_vspmfilter_buffer_pool_new (space, FALSE);
+    /* create a new buffer pool; its buf_info is filled in below */
+    space->out_gst_pool = gst_vspmfilter_buffer_pool_new (space);
+    out_buf_info =
+        &GST_VSPMFILTER_BUFFER_POOL_CAST (space->out_gst_pool)->buf_info;
+
+    gst_vspm_filter_set_buffer_info (space, out_buf_info, out_info, NULL);
 
     structure = gst_buffer_pool_get_config (space->out_gst_pool);
     gst_buffer_pool_config_set_params(structure, outcaps,
-                                      space->out_buf_info.buf_size,
+                                      out_buf_info->buf_size,
                                       MIN_BUFFERS, MAX_BUFFERS);
     if (!gst_buffer_pool_set_config (space->out_gst_pool, structure)) {
       GST_WARNING_OBJECT (space, "failed to configure output buffer pool");
     }
   } else {
     /* outbuf-alloc turned off (or never on): make sure no stale pool lingers */
-    gst_vspm_filter_free_pool (space->out_vspm_pool, &space->out_gst_pool);
+    gst_vspm_filter_free_pool (&space->out_gst_pool);
   }
 
   if (space->inbuf_allocate) {
-    gst_vspm_filter_set_buffer_info (space, &space->in_buf_info, in_info, NULL);
+    VspmBufferInfo *in_buf_info;
 
     /* Drop any pool from a previous negotiation so we never hand out
      * buffers sized for stale caps after a resolution change. */
-    gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
+    gst_vspm_filter_free_pool (&space->in_gst_pool);
 
-    space->in_gst_pool = gst_vspmfilter_buffer_pool_new (space, TRUE);
+    space->in_gst_pool = gst_vspmfilter_buffer_pool_new (space);
+    in_buf_info =
+        &GST_VSPMFILTER_BUFFER_POOL_CAST (space->in_gst_pool)->buf_info;
+
+    gst_vspm_filter_set_buffer_info (space, in_buf_info, in_info, NULL);
 
     structure = gst_buffer_pool_get_config (space->in_gst_pool);
     /* Let upstream decide the number of buffers it needs */
     gst_buffer_pool_config_set_params (structure, incaps,
-        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+        in_buf_info->buf_size, MIN_BUFFERS, 0);
     /* VIDEO_META lets upstream accept our ISU-aligned stride/offset
      * without padding or an extra copy. */
     gst_buffer_pool_config_add_option (structure,
@@ -846,7 +856,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     }
   } else {
     /* inbuf-alloc turned off (or never on): make sure no stale pool lingers */
-    gst_vspm_filter_free_pool (space->in_vspm_pool, &space->in_gst_pool);
+    gst_vspm_filter_free_pool (&space->in_gst_pool);
   }
 
   return TRUE;
@@ -870,6 +880,8 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
     GstStructure *config;
     GstVideoAlignment align;
     guint i;
+    VspmBufferInfo *out_buf_info =
+        &GST_VSPMFILTER_BUFFER_POOL_CAST (space->out_gst_pool)->buf_info;
 
     if (gst_query_get_n_allocation_pools (query)) {
       gst_query_parse_nth_allocation_pool(query, 0, &pool, NULL, NULL, NULL);
@@ -892,7 +904,7 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
 
           for (i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
             if ((align.stride_align[i] != 0) &&
-                (space->out_buf_info.plane_stride[i] % align.stride_align[i] != 0)) {
+                (out_buf_info->plane_stride[i] % align.stride_align[i] != 0)) {
               update = TRUE;
               break;
             }
@@ -914,13 +926,13 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
         }
       }
 
-      gst_vspm_filter_set_buffer_info (space, &space->out_buf_info, NULL, &align);
+      gst_vspm_filter_set_buffer_info (space, out_buf_info, NULL, &align);
 
       structure = gst_buffer_pool_get_config (space->out_gst_pool);
       gst_buffer_pool_config_get_params(structure, &caps, NULL, NULL, NULL);
 
       gst_buffer_pool_config_set_params(structure, caps,
-                                        space->out_buf_info.buf_size,
+                                        out_buf_info->buf_size,
                                         MIN_BUFFERS, MAX_BUFFERS);
 
       if (!gst_buffer_pool_set_config (space->out_gst_pool, structure)) {
@@ -937,6 +949,7 @@ gst_vspm_filter_propose_allocation (GstBaseTransform * trans,
     GstQuery * decide_query, GstQuery * query)
 {
   GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
+  VspmBufferInfo *in_buf_info;
 
   if (!GST_BASE_TRANSFORM_CLASS (parent_class)->propose_allocation (trans,
           decide_query, query))
@@ -955,17 +968,19 @@ gst_vspm_filter_propose_allocation (GstBaseTransform * trans,
     return TRUE;
   }
 
+  in_buf_info = &GST_VSPMFILTER_BUFFER_POOL_CAST (space->in_gst_pool)->buf_info;
+
   /* Let upstream decide the number of buffers it needs */
   if (gst_query_get_n_allocation_pools (query) > 0)
     gst_query_set_nth_allocation_pool (query, 0, space->in_gst_pool,
-        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+        in_buf_info->buf_size, MIN_BUFFERS, 0);
   else
     gst_query_add_allocation_pool (query, space->in_gst_pool,
-        space->in_buf_info.buf_size, MIN_BUFFERS, 0);
+        in_buf_info->buf_size, MIN_BUFFERS, 0);
 
   GST_DEBUG_OBJECT (space,
       "proposed input pool=%p size=%u min=%d max=%d",
-      space->in_gst_pool, space->in_buf_info.buf_size,
+      space->in_gst_pool, in_buf_info->buf_size,
       MIN_BUFFERS, 0);
 
   return TRUE;
@@ -1170,10 +1185,6 @@ gst_vspm_filter_finalize (GObject * obj)
   }
   if (space->mmngr_import_list)
     g_queue_free (space->mmngr_import_list);
-  if (space->in_vspm_pool)
-    g_free (space->in_vspm_pool);
-  if (space->out_vspm_pool)
-    g_free (space->out_vspm_pool);
   /* free space->allocator when finalize */
   if (space->allocator)
     gst_object_unref(space->allocator);
@@ -1187,23 +1198,15 @@ static void
 gst_vspm_filter_init (GstVspmFilter * space)
 {
   GstVspmFilterVspInfo *vsp_info;
-  VspmBufferPool *in_vspm_pool;
-  VspmBufferPool *out_vspm_pool;
 
   space->vsp_info      = g_malloc0 (sizeof (GstVspmFilterVspInfo));
-  space->in_vspm_pool  = g_malloc0 (sizeof (VspmBufferPool));
-  space->out_vspm_pool = g_malloc0 (sizeof (VspmBufferPool));
-  if (!space->vsp_info
-    || !space->in_vspm_pool
-    || !space->out_vspm_pool) {
+  if (!space->vsp_info) {
     GST_ELEMENT_ERROR (space, RESOURCE, NO_SPACE_LEFT,
         ("Could not allocate vsp info"), ("Could not allocate vsp info"));
     return;
   }
 
   vsp_info      = space->vsp_info;
-  in_vspm_pool  = space->in_vspm_pool;
-  out_vspm_pool = space->out_vspm_pool;
 
   vsp_info->is_init_vspm = FALSE;
   vsp_info->format_flag  = 0;
@@ -1221,8 +1224,6 @@ gst_vspm_filter_init (GstVspmFilter * space)
     GST_ERROR ("VSPM: Error Initialized. \n");
   }
 
-  in_vspm_pool->used_count  = 0;
-  out_vspm_pool->used_count = 0;
   space->allocator          = gst_dmabuf_allocator_new ();
   space->outbuf_allocate    = FALSE;
   space->inbuf_allocate     = FALSE;
@@ -1456,7 +1457,11 @@ gst_vspm_filter_mem_is_contiguous (GstVspmFilter * space, GstBuffer * buf,
 static gboolean
 gst_vspm_filter_buffer_layout_matches (GstVspmFilter * space, GstBuffer * buf)
 {
-  VspmBufferInfo *outbuf_info = &space->out_buf_info;
+  if (!space->out_gst_pool)
+    return FALSE;
+
+  VspmBufferInfo *outbuf_info =
+      &GST_VSPMFILTER_BUFFER_POOL_CAST (space->out_gst_pool)->buf_info;
   GstVideoInfo *in_info = &GST_VIDEO_FILTER (space)->in_info;
   GstVideoMeta *vmeta = gst_buffer_get_video_meta (buf);
   guint plane, n_planes = outbuf_info->n_planes;

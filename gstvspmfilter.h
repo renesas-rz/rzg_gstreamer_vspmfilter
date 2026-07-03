@@ -90,23 +90,6 @@ typedef struct _GstVspmFilterVspInfo GstVspmFilterVspInfo;
 typedef struct _GstVspmFilterBufferPool GstVspmFilterBufferPool;
 typedef struct _GstVspmFilterBufferPoolClass GstVspmFilterBufferPoolClass;
 
-struct _GstVspmFilterBufferPool
-{
-  GstBufferPool bufferpool;
-
-  GstVspmFilter *vspmfilter;
-
-  GstCaps *caps;
-
-  /* TRUE if this pool serves input (upstream) buffers, FALSE for output */
-  gboolean is_input;
-};
-
-struct _GstVspmFilterBufferPoolClass
-{
-  GstBufferPoolClass parent_class;
-};
-
 struct buffer {
   void *start;
   size_t length;
@@ -173,6 +156,21 @@ typedef struct {
   gint  plane_size[GST_VIDEO_MAX_PLANES];
 } VspmBufferInfo;
 
+struct _GstVspmFilterBufferPool
+{
+  GstBufferPool bufferpool;
+
+  GstVspmFilter *vspmfilter;
+
+  VspmBufferPool vspm_pool;
+  VspmBufferInfo buf_info;
+};
+
+struct _GstVspmFilterBufferPoolClass
+{
+  GstBufferPoolClass parent_class;
+};
+
 /**
  * GstVspmFilter:
  *
@@ -186,12 +184,8 @@ struct _GstVspmFilter {
   guint use_dmabuf;
   guint outbuf_allocate;
   guint inbuf_allocate;
-  VspmBufferInfo in_buf_info;
-  VspmBufferInfo out_buf_info;
   GstBufferPool  *in_gst_pool;
   GstBufferPool  *out_gst_pool;
-  VspmBufferPool *in_vspm_pool;
-  VspmBufferPool *out_vspm_pool;
   GQueue *mmngr_import_list;
   sem_t smp_wait;
   /* Crop parameters */
