@@ -1926,11 +1926,6 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     rs_par.pad_val        = 0;
     rs_par.x_ratio        = (unsigned short)( (crop_in_width << 12) / out_width );
     rs_par.y_ratio        = (unsigned short)( (crop_in_height << 12) / out_height );
-    if (!(rs_par.x_ratio & 0x0000F000) || !(rs_par.y_ratio & 0x0000F000)) {
-      GST_ERROR("ISU driver does not support scale up\n");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
   }
 
   {
