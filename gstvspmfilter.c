@@ -1889,6 +1889,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     guint crop_in_height = 0;
     guint crop_start_x   = 0;
     guint crop_start_y   = 0;
+    gdouble scale_x      = 0;
+    gdouble scale_y      = 0;
 
     memset(&rs_par, 0, sizeof(T_ISU_RS));
 
@@ -1926,6 +1928,11 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     rs_par.pad_val        = 0;
     rs_par.x_ratio        = (unsigned short)( (crop_in_width << 12) / out_width );
     rs_par.y_ratio        = (unsigned short)( (crop_in_height << 12) / out_height );
+    scale_x               = (gdouble)4096 / rs_par.x_ratio;
+    scale_y               = (gdouble)4096 / rs_par.y_ratio;
+
+    GST_DEBUG_OBJECT(space,
+        "resize: horizontal x %.3f, vertical x %.3f", scale_x, scale_y);
   }
 
   {
