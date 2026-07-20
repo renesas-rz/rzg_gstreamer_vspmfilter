@@ -822,7 +822,11 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     gst_vspm_filter_free_pool (&space->out_gst_pool);
   }
 
-  if (space->inbuf_allocate) {
+  /* Rebuild only when the input changed; filter->in_info still holds the
+   * previous caps, GstVideoFilter assigns the new one after set_info(). */
+  if (space->inbuf_allocate &&
+      ((space->in_gst_pool == NULL) ||
+       (!gst_video_info_is_equal (&filter->in_info, in_info)))) {
     VspmBufferInfo *in_buf_info;
 
     /* Drop any pool from a previous negotiation so we never hand out
@@ -846,7 +850,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     if (!gst_buffer_pool_set_config (space->in_gst_pool, structure)) {
       GST_WARNING_OBJECT (space, "failed to configure input buffer pool");
     }
-  } else {
+  } else if (!space->inbuf_allocate) {
     /* inbuf-alloc turned off (or never on): make sure no stale pool lingers */
     gst_vspm_filter_free_pool (&space->in_gst_pool);
   }
