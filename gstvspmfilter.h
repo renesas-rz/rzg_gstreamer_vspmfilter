@@ -185,6 +185,14 @@ struct _GstVspmFilter {
   GstBufferPool  *out_gst_pool;
   GQueue *mmngr_import_list;
   sem_t smp_wait;
+  /* Crop parameters */
+  struct {
+    guint32 left;
+    guint32 right;
+    guint32 top;
+    guint32 bottom;
+  } crop;
+  gboolean enable_crop;
 };
 
 struct _GstVspmFilterClass
