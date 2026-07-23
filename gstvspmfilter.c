@@ -388,6 +388,57 @@ gst_vspm_filter_caps_remove_format_info (GstCaps * caps)
   return res;
 }
 
+/* Read the crop borders */
+static void
+gst_vspm_filter_get_crop_value (GstVspmFilter * space, guint * left, guint * right,
+    guint * top, guint * bottom)
+{
+  *left   = space->crop.left;
+  *right  = space->crop.right;
+  *top    = space->crop.top;
+  *bottom = space->crop.bottom;
+}
+
+/* Round each crop border DOWN to align with YUV specification, using whichever of
+ * the input and output formats needs the larger unit; an unaligned border makes
+ * the driver reject the job. A NULL format info is a format that is not fixed
+ * yet. TRUE if a border changed. */
+static gboolean
+gst_vspm_filter_align_crop (const GstVideoFormatInfo * in_fmt_info,
+    const GstVideoFormatInfo * out_fmt_info, guint * left, guint * right,
+    guint * top, guint * bottom)
+{
+  guint h_unit   = 1;
+  guint v_unit   = 1;
+  guint o_left   = *left;
+  guint o_right  = *right;
+  guint o_top    = *top;
+  guint o_bottom = *bottom;
+
+  /* Component 1 is chroma; its subsampling gives the unit:
+   *   YCbCr 4:2:0: 2-pixel units for both horizontal and vertical settings
+   *   YCbCr 4:2:2: 2-pixel units for horizontal and 1-pixel units for vertical
+   *   other formats: 1-pixel units for all dimensions
+   * A non-YUV format keeps the unit at 1, so only the YUV side of a conversion
+   * constrains it. */
+  if (in_fmt_info && GST_VIDEO_FORMAT_INFO_IS_YUV (in_fmt_info)) {
+    h_unit = 1U << GST_VIDEO_FORMAT_INFO_W_SUB (in_fmt_info, 1);
+    v_unit = 1U << GST_VIDEO_FORMAT_INFO_H_SUB (in_fmt_info, 1);
+  }
+  if (out_fmt_info && GST_VIDEO_FORMAT_INFO_IS_YUV (out_fmt_info)) {
+    h_unit = MAX (h_unit, 1U << GST_VIDEO_FORMAT_INFO_W_SUB (out_fmt_info, 1));
+    v_unit = MAX (v_unit, 1U << GST_VIDEO_FORMAT_INFO_H_SUB (out_fmt_info, 1));
+  }
+
+  *left   -= *left   % h_unit;
+  *right  -= *right  % h_unit;
+  *top    -= *top    % v_unit;
+  *bottom -= *bottom % v_unit;
+
+  return ((o_left != *left) || (o_right  != *right) ||
+          (o_top  != *top)  || (o_bottom != *bottom));
+}
+
 static GstCaps *
 gst_vspm_filter_fixate_caps (GstBaseTransform * trans,
     GstPadDirection direction, GstCaps * caps, GstCaps * othercaps)
@@ -416,8 +467,25 @@ gst_vspm_filter_fixate_caps (GstBaseTransform * trans,
   if (!w || !h) {
     if (space->enable_crop && direction == GST_PAD_SINK) {
       /* When going SINK->SRC with crop enabled, propose cropped dimensions */
-      gint crop_w = from_w - space->crop.left - space->crop.right;
-      gint crop_h = from_h - space->crop.top  - space->crop.bottom;
+      gint crop_w, crop_h;
+      guint c_left, c_right, c_top, c_bottom;
+
+      const gchar *in_fmt  = gst_structure_get_string (ins, "format");
+      const gchar *out_fmt = gst_structure_get_string (outs, "format");
+
+      gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom);
+
+      /* Align first so this size tracks the crop transform_frame() applies.
+       * Best-effort: the out format may still be unfixed here. */
+      (void) gst_vspm_filter_align_crop (
+          in_fmt ?
+          gst_video_format_get_info (gst_video_format_from_string (in_fmt)) : NULL,
+          out_fmt ?
+          gst_video_format_get_info (gst_video_format_from_string (out_fmt)) : NULL,
+          &c_left, &c_right, &c_top, &c_bottom);
+
+      crop_w = from_w - (gint) (c_left + c_right);
+      crop_h = from_h - (gint) (c_top  + c_bottom);
       if (crop_w > 0 && crop_h > 0) {
         gst_structure_fixate_field_nearest_int (outs, "width", crop_w);
         gst_structure_fixate_field_nearest_int (outs, "height", crop_h);
@@ -707,6 +775,24 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
   /* if present, these must match too */
   if (in_info->interlace_mode != out_info->interlace_mode)
     goto format_mismatch;
+
+  /* Turn passthrough off while cropping: the class sets
+   * passthrough_on_same_caps, so with equal caps on both pads the buffer would
+   * be pushed through untouched and the crop lost. */
+  if (space->enable_crop) {
+    if (gst_vspm_filter_align_crop (in_info->finfo, out_info->finfo,
+            &space->crop.left, &space->crop.right, &space->crop.top,
+            &space->crop.bottom))
+      GST_DEBUG_OBJECT (space, "crop left:right:top:bottom aligned down to "
+          "%u:%u:%u:%u for the YUV specification of the negotiated format",
+          space->crop.left, space->crop.right, space->crop.top,
+          space->crop.bottom);
+
+    /* The aligned borders decide whether anything is left to crop. */
+    if (space->crop.left || space->crop.right || space->crop.top ||
+        space->crop.bottom)
+      gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (filter), FALSE);
+  }
 
   GST_DEBUG ("reconfigured %d %d", GST_VIDEO_INFO_FORMAT (in_info),
       GST_VIDEO_INFO_FORMAT (out_info));
@@ -1036,7 +1122,9 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_VSPM_CROP,
       g_param_spec_string ("crop", "Crop information",
-        "Crop input frames. Format: \"left:right:top:bottom\" in pixels.",
+        "Crop input frames. Format: \"left:right:top:bottom\" in pixels. Reads "
+        "back the borders in effect, rounded down to align with YUV "
+        "specification.",
         NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
         GST_PARAM_MUTABLE_READY));
   gstelement_class->change_state = gst_vspmfilter_change_state;
@@ -1151,10 +1239,13 @@ gst_vspm_filter_parse_cropsize (GObject * object, const GValue * value)
   GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (object);
   const gchar *str_value = g_value_get_string (value);
 
-  gchar **str_arr, *end_char;
+  gchar **str_arr = NULL, *end_char;
   gint length = 4; /* fixed-size array */
   gint64 crop_arr[4] = { 0, };
   gint i;
+
+  if (str_value == NULL)
+    goto error;
 
   str_arr = g_strsplit (str_value, ":", length);
   if (str_arr == NULL)
@@ -1210,6 +1301,10 @@ gst_vspm_filter_set_property (GObject * object, guint property_id,
       break;
     case PROP_VSPM_CROP:
       space->enable_crop = gst_vspm_filter_parse_cropsize (object, value);
+      if (space->enable_crop)
+        GST_DEBUG_OBJECT (space, "crop left:right:top:bottom set to %u:%u:%u:%u",
+            space->crop.left, space->crop.right, space->crop.top,
+            space->crop.bottom);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -1565,25 +1660,28 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
   guint crop_start_y   = 0;
   guint crop_in_width  = 0;
   guint crop_in_height = 0;
+  guint c_left, c_right, c_top, c_bottom;
 
-  /* Validate crop parameters against input dimensions */
-  if ((space->crop.left + space->crop.right) >= (guint) in_width) {
+  gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom);
+
+  /* Validate the requested borders against the input */
+  if ((c_left + c_right) >= (guint) in_width) {
     GST_ERROR ("Crop left(%u) + right(%u) >= input width(%d)\n",
-               space->crop.left, space->crop.right, in_width);
+               c_left, c_right, in_width);
     ret = GST_FLOW_ERROR;
     goto err;
   }
-  if ((space->crop.top + space->crop.bottom) >= (guint) in_height) {
+  if ((c_top + c_bottom) >= (guint) in_height) {
     GST_ERROR ("Crop top(%u) + bottom(%u) >= input height(%d)\n",
-               space->crop.top, space->crop.bottom, in_height);
+               c_top, c_bottom, in_height);
     ret = GST_FLOW_ERROR;
     goto err;
   }
 
-  crop_start_x   = space->crop.left;
-  crop_start_y   = space->crop.top;
-  crop_in_width  = in_width  - space->crop.left - space->crop.right;
-  crop_in_height = in_height - space->crop.top  - space->crop.bottom;
+  crop_start_x   = c_left;
+  crop_start_y   = c_top;
+  crop_in_width  = in_width  - c_left - c_right;
+  crop_in_height = in_height - c_top  - c_bottom;
 
   GST_DEBUG_OBJECT (space,
       "crop: start(%u,%u) cropped size(%ux%u) from input(%dx%d)",
