@@ -399,15 +399,19 @@ gst_vspm_filter_caps_remove_format_info (GstCaps * caps)
   return res;
 }
 
-/* Read the crop borders */
-static void
+/* Read the crop borders under the object lock. TRUE if they amount to a crop. */
+static gboolean
 gst_vspm_filter_get_crop_value (GstVspmFilter * space, guint * left, guint * right,
     guint * top, guint * bottom)
 {
+  GST_OBJECT_LOCK (space);
   *left   = space->crop.left;
   *right  = space->crop.right;
   *top    = space->crop.top;
   *bottom = space->crop.bottom;
+  GST_OBJECT_UNLOCK (space);
+
+  return (*left || *right || *top || *bottom);
 }
 
 /* Round each crop border DOWN to align with YUV specification, using whichever of
@@ -476,15 +480,15 @@ gst_vspm_filter_fixate_caps (GstBaseTransform * trans,
   gst_structure_get_int (outs, "height", &h);
 
   if (!w || !h) {
-    if (space->enable_crop && direction == GST_PAD_SINK) {
-      /* When going SINK->SRC with crop enabled, propose cropped dimensions */
+    guint c_left, c_right, c_top, c_bottom;
+
+    if (gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom)
+        && direction == GST_PAD_SINK) {
+      /* Going SINK->SRC with a crop set: propose the cropped size */
       gint crop_w, crop_h;
-      guint c_left, c_right, c_top, c_bottom;
 
       const gchar *in_fmt  = gst_structure_get_string (ins, "format");
       const gchar *out_fmt = gst_structure_get_string (outs, "format");
-
-      gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom);
 
       /* Align first so this size tracks the crop transform_frame() applies.
        * Best-effort: the out format may still be unfixed here. */
@@ -794,6 +798,55 @@ gst_vspm_filter_free_buffer_pools (GstVspmFilter * space)
   gst_vspm_filter_free_pool (&space->out_gst_pool);
 }
 
+/* Clear crop_dirty, validate the crop for the negotiated caps (warning if it is
+ * out of range), align the borders for them, and set passthrough to match. */
+static void
+gst_vspm_filter_configure_crop (GstVspmFilter * space, GstVideoInfo * in_info,
+    GstVideoInfo * out_info)
+{
+  guint in_w = GST_VIDEO_INFO_WIDTH (in_info);
+  guint in_h = GST_VIDEO_INFO_HEIGHT (in_info);
+  gboolean crop_needed  = FALSE;
+  gboolean out_of_range = FALSE;
+  gboolean was_aligned  = FALSE;
+
+  GST_OBJECT_LOCK (space);
+  out_of_range = ((space->crop.left + space->crop.right)  >= in_w ||
+                  (space->crop.top  + space->crop.bottom) >= in_h);
+  if (!out_of_range) {
+    was_aligned = gst_vspm_filter_align_crop (in_info->finfo, out_info->finfo,
+        &space->crop.left, &space->crop.right, &space->crop.top,
+        &space->crop.bottom);
+
+    /* The aligned borders decide whether anything is left to crop. */
+    crop_needed = (space->crop.left || space->crop.right ||
+                   space->crop.top  || space->crop.bottom);
+  }
+  space->crop_dirty = FALSE;
+  GST_OBJECT_UNLOCK (space);
+
+  if (out_of_range) {
+    /* Too big to fit: warn and skip, but keep the borders for a larger input. */
+    GST_ELEMENT_WARNING (space, STREAM, FORMAT,
+        ("Crop out of range for %ux%u input, ignoring it", in_w, in_h),
+        ("crop left:right:top:bottom %u:%u:%u:%u does not fit "
+         "(left+right=%u vs width=%u, top+bottom=%u vs height=%u)",
+         space->crop.left, space->crop.right, space->crop.top,
+         space->crop.bottom, space->crop.left + space->crop.right, in_w,
+         space->crop.top + space->crop.bottom, in_h));
+  } else if (was_aligned) {
+    GST_DEBUG_OBJECT (space, "crop left:right:top:bottom aligned down to "
+        "%u:%u:%u:%u for the YUV specification of the negotiated format",
+        space->crop.left, space->crop.right, space->crop.top,
+        space->crop.bottom);
+  }
+
+  /* Set both ways, not just off: on the prepare_output_buffer() path nothing
+   * else restores it. Pass through only with no crop and equal caps. */
+  gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (space),
+      !crop_needed && gst_video_info_is_equal (in_info, out_info));
+}
+
 static gboolean
 gst_vspm_filter_set_info (GstVideoFilter * filter,
     GstCaps * incaps, GstVideoInfo * in_info, GstCaps * outcaps,
@@ -814,23 +867,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
   if (in_info->interlace_mode != out_info->interlace_mode)
     goto format_mismatch;
 
-  /* Turn passthrough off while cropping: the class sets
-   * passthrough_on_same_caps, so with equal caps on both pads the buffer would
-   * be pushed through untouched and the crop lost. */
-  if (space->enable_crop) {
-    if (gst_vspm_filter_align_crop (in_info->finfo, out_info->finfo,
-            &space->crop.left, &space->crop.right, &space->crop.top,
-            &space->crop.bottom))
-      GST_DEBUG_OBJECT (space, "crop left:right:top:bottom aligned down to "
-          "%u:%u:%u:%u for the YUV specification of the negotiated format",
-          space->crop.left, space->crop.right, space->crop.top,
-          space->crop.bottom);
-
-    /* The aligned borders decide whether anything is left to crop. */
-    if (space->crop.left || space->crop.right || space->crop.top ||
-        space->crop.bottom)
-      gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (filter), FALSE);
-  }
+  gst_vspm_filter_configure_crop (space, in_info, out_info);
 
   GST_DEBUG ("reconfigured %d %d", GST_VIDEO_INFO_FORMAT (in_info),
       GST_VIDEO_INFO_FORMAT (out_info));
@@ -1080,7 +1117,18 @@ static GstFlowReturn gst_vspm_filter_prepare_output_buffer (GstBaseTransform * t
                                           GstBuffer *inbuf, GstBuffer **outbuf)
 {
     GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
+    GstVideoFilter *filter = GST_VIDEO_FILTER_CAST (trans);
     GstFlowReturn ret = GST_FLOW_OK;
+    gboolean crop_dirty;
+
+    /* Apply a pending crop that set_info() was skipped for, still ahead of the
+     * passthrough check so it counts for this buffer. */
+    GST_OBJECT_LOCK (space);
+    crop_dirty = space->crop_dirty;
+    GST_OBJECT_UNLOCK (space);
+    if (G_UNLIKELY (crop_dirty))
+      gst_vspm_filter_configure_crop (space, &filter->in_info,
+          &filter->out_info);
 
     gboolean base_passthrough = gst_base_transform_is_passthrough (trans);
     gboolean do_passthrough   = base_passthrough &&
@@ -1224,7 +1272,7 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
         "back the borders in effect, rounded down to align with YUV "
         "specification.",
         NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
-        GST_PARAM_MUTABLE_READY));
+        GST_PARAM_MUTABLE_PLAYING));
   gstelement_class->change_state = gst_vspmfilter_change_state;
   gstbasetransform_class->transform_caps =
       GST_DEBUG_FUNCPTR (gst_vspm_filter_transform_caps);
@@ -1329,13 +1377,14 @@ gst_vspm_filter_init (GstVspmFilter * space)
   space->crop.right  = 0;
   space->crop.top    = 0;
   space->crop.bottom = 0;
-  space->enable_crop = FALSE;
+  space->crop_dirty  = FALSE;
 
   sem_init (&space->smp_wait, 0, 0);
 }
 
 static gboolean
-gst_vspm_filter_parse_cropsize (GObject * object, const GValue * value)
+gst_vspm_filter_parse_cropsize (GObject * object, const GValue * value,
+    guint32 * left, guint32 * right, guint32 * top, guint32 * bottom)
 {
   GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (object);
   const gchar *str_value = g_value_get_string (value);
@@ -1365,16 +1414,17 @@ gst_vspm_filter_parse_cropsize (GObject * object, const GValue * value)
   }
   g_strfreev (str_arr);
 
-  space->crop.left   = crop_arr[0];
-  space->crop.right  = crop_arr[1];
-  space->crop.top    = crop_arr[2];
-  space->crop.bottom = crop_arr[3];
+  /* Hand the parsed borders back to the caller. */
+  *left   = crop_arr[0];
+  *right  = crop_arr[1];
+  *top    = crop_arr[2];
+  *bottom = crop_arr[3];
 
   return TRUE;
 
 error:
-  GST_ERROR_OBJECT (space, "Failed to parse crop size: %s. Using default instead",
-                    str_value);
+  GST_ERROR_OBJECT (space, "Failed to parse crop size: %s. Keeping the crop "
+                    "already in effect", str_value);
   if (str_arr)
     g_strfreev (str_arr);
   return FALSE;
@@ -1401,12 +1451,53 @@ gst_vspm_filter_set_property (GObject * object, guint property_id,
           space->outbuf_allocate = TRUE;
       break;
     case PROP_VSPM_CROP:
-      space->enable_crop = gst_vspm_filter_parse_cropsize (object, value);
-      if (space->enable_crop)
-        GST_DEBUG_OBJECT (space, "crop left:right:top:bottom set to %u:%u:%u:%u",
-            space->crop.left, space->crop.right, space->crop.top,
-            space->crop.bottom);
+    {
+      GstVideoFilter *filter = GST_VIDEO_FILTER_CAST (object);
+      guint32 left, right, top, bottom;
+
+      if (!gst_vspm_filter_parse_cropsize (object, value, &left, &right, &top,
+              &bottom))
+        break;
+
+      /* Reject a crop too big for the current input and keep the running one,
+       * so a bad value never drops a working crop, like one that fails to
+       * parse. Only checkable once negotiated. in_info is read unlocked on
+       * purpose: transform_frame() re-checks it on the streaming thread, so a
+       * stale size here at worst rejects a good crop or defers a bad one. */
+      if (filter->negotiated &&
+          ((left + right) >= (guint) GST_VIDEO_INFO_WIDTH (&filter->in_info) ||
+           (top + bottom) >= (guint) GST_VIDEO_INFO_HEIGHT (&filter->in_info))) {
+        GST_WARNING_OBJECT (space, "Crop %u:%u:%u:%u out of range for %dx%d "
+            "input, keeping the crop already in effect", left, right, top,
+            bottom, GST_VIDEO_INFO_WIDTH (&filter->in_info),
+            GST_VIDEO_INFO_HEIGHT (&filter->in_info));
+        break;
+      }
+
+      GST_DEBUG_OBJECT (space, "crop left:right:top:bottom set to %u:%u:%u:%u",
+          left, right, top, bottom);
+
+      if (filter->negotiated &&
+          gst_vspm_filter_align_crop (filter->in_info.finfo,
+              filter->out_info.finfo, &left, &right, &top, &bottom))
+        GST_DEBUG_OBJECT (space, "crop left:right:top:bottom aligned down to "
+            "%u:%u:%u:%u for the YUV specification of the negotiated format",
+            left, right, top, bottom);
+
+      /* Store the borders and the flag together, the streaming thread reads
+       * them under this lock. */
+      GST_OBJECT_LOCK (space);
+      space->crop.left   = left;
+      space->crop.right  = right;
+      space->crop.top    = top;
+      space->crop.bottom = bottom;
+      space->crop_dirty  = TRUE;
+      GST_OBJECT_UNLOCK (space);
+
+      /* Renegotiate so the borders can shape the output size. */
+      gst_base_transform_reconfigure_src (trans);
       break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -1430,11 +1521,12 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
       break;
     case PROP_VSPM_CROP:
     {
-      gchar *str_value = g_strdup_printf ("%d:%d:%d:%d",
-                                          space->crop.left,
-                                          space->crop.right,
-                                          space->crop.top,
-                                          space->crop.bottom);
+      guint c_left, c_right, c_top, c_bottom;
+      gchar *str_value;
+
+      (void) gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom);
+      str_value = g_strdup_printf ("%u:%u:%u:%u",
+                                   c_left, c_right, c_top, c_bottom);
       g_value_set_string (value, str_value);
       g_free (str_value);
       break;
@@ -2075,8 +2167,8 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
   {
     /* Setting resize parameters */
-    guint crop_in_width  = 0;
-    guint crop_in_height = 0;
+    guint crop_in_width  = in_width;
+    guint crop_in_height = in_height;
     guint crop_start_x   = 0;
     guint crop_start_y   = 0;
     gdouble scale_x      = 0;
@@ -2085,31 +2177,27 @@ gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
     memset(&rs_par, 0, sizeof(T_ISU_RS));
 
-    gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom);
+    if (gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom)) {
+      /* Validate the requested borders against the input */
+      if ((c_left + c_right) < (guint) in_width &&
+          (c_top + c_bottom) < (guint) in_height) {
+        crop_start_x   = c_left;
+        crop_start_y   = c_top;
+        crop_in_width  = in_width  - c_left - c_right;
+        crop_in_height = in_height - c_top  - c_bottom;
 
-    /* Validate the requested borders against the input */
-    if ((c_left + c_right) >= (guint) in_width) {
-      GST_ERROR ("Crop left(%u) + right(%u) >= input width(%d)\n",
-                 c_left, c_right, in_width);
-      ret = GST_FLOW_ERROR;
-      goto err;
+        GST_DEBUG_OBJECT (space,
+            "crop: start(%u,%u) cropped size(%ux%u) from input(%dx%d)",
+            crop_start_x, crop_start_y, crop_in_width, crop_in_height,
+            in_width, in_height);
+      } else {
+        /* Out of range for this input. configure_crop() already warned on the
+         * bus, so log quietly here rather than repeat it for every buffer. */
+        GST_DEBUG_OBJECT (space,
+            "crop %u:%u:%u:%u does not fit %dx%d input, skipping",
+            c_left, c_right, c_top, c_bottom, in_width, in_height);
+      }
     }
-    if ((c_top + c_bottom) >= (guint) in_height) {
-      GST_ERROR ("Crop top(%u) + bottom(%u) >= input height(%d)\n",
-                 c_top, c_bottom, in_height);
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-
-    crop_start_x   = c_left;
-    crop_start_y   = c_top;
-    crop_in_width  = in_width  - c_left - c_right;
-    crop_in_height = in_height - c_top  - c_bottom;
-
-    GST_DEBUG_OBJECT (space,
-        "crop: start(%u,%u) cropped size(%ux%u) from input(%dx%d)",
-        crop_start_x, crop_start_y, crop_in_width, crop_in_height,
-        in_width, in_height);
 
     rs_par.start_x        = crop_start_x;
     rs_par.start_y        = crop_start_y;
