@@ -70,20 +70,20 @@ G_DEFINE_TYPE (GstVspmFilterBufferPool, gst_vspmfilter_buffer_pool, GST_TYPE_BUF
 
 static void gst_vspm_filter_set_property (GObject * object,
     guint property_id, const GValue * value, GParamSpec * pspec);
+static gboolean gst_vspm_filter_parse_cropsize (GObject * object,
+    const GValue * value, guint32 * left, guint32 * right, guint32 * top,
+    guint32 * bottom);
+static void append_caps_from_table (GstCaps * caps, const extensions_t * table);
+static GstFlowReturn gst_vspm_filter_transform_frame (GstVideoFilter * filter,
+    GstVideoFrame * in_frame, GstVideoFrame * out_frame);
 static void gst_vspm_filter_get_property (GObject * object,
     guint property_id, GValue * value, GParamSpec * pspec);
-static GstFlowReturn
+GstFlowReturn
 gst_vspm_filter_transform_buffer (GstVideoFilter * filter,
                                     GstBuffer * inbuf,
                                     GstBuffer * outbuf);
 
 static void gst_vspm_filter_free_buffer_pools (GstVspmFilter * space);
-static void gst_vspm_filter_set_buffer_info (GstVspmFilter * space, VspmBufferInfo * buf_info,
-    GstVideoInfo * info, GstVideoAlignment * align);
-
-static GstFlowReturn gst_vspm_filter_get_mem_phys_addr (GstVspmFilter * space,
-    GstBuffer * buf, gpointer vir_addr, guint plane, gsize plane_offset,
-    gpointer * out_phy);
 
 static gboolean gst_vspm_filter_propose_allocation (GstBaseTransform * trans,
     GstQuery * decide_query, GstQuery * query);
@@ -96,8 +96,6 @@ static GstFlowReturn gst_vspm_filter_transform_frame (GstVideoFilter * filter,
 
 static void gst_vspm_filter_finalize (GObject * obj);
 
-static void gst_vspm_filter_import_fd (GstMemory *mem, gsize plane_offset, gpointer *out, GQueue *import_list);
-static void gst_vspm_filter_release_fd (GQueue *import_list);
 static gboolean
 gst_vspm_filter_buffer_can_passthrough (GstVspmFilter * space, GstBuffer * buf);
 
@@ -194,7 +192,7 @@ gst_vspm_filter_free_pool (GstBufferPool ** gst_pool)
   *gst_pool = NULL;
 }
 
-static GstFlowReturn
+GstFlowReturn
 gst_vspm_filter_alloc_buffer (GstVspmFilter * space, VspmBufferInfo * buf_info,
     VspmBuffer * vspm_buf, GstBuffer ** gst_buf)
 {
@@ -277,7 +275,7 @@ gst_vspm_filter_alloc_buffer (GstVspmFilter * space, VspmBufferInfo * buf_info,
   return GST_FLOW_OK;
 }
 
-static GstFlowReturn
+GstFlowReturn
 gst_vspm_filter_allocate_port_buffer (GstVspmFilter * space, VspmBufferPool * vspm_pool,
     VspmBufferInfo * buf_info, GstBuffer ** buffer)
 {
@@ -304,7 +302,7 @@ gst_vspmfilter_buffer_pool_free_buffer (GstBufferPool * bpool, GstBuffer * buffe
   gst_buffer_unref (buffer);
 }
 
-static GstFlowReturn
+GstFlowReturn
 gst_vspmfilter_buffer_pool_alloc_buffer (GstBufferPool * bpool,
     GstBuffer ** buffer, GstBufferPoolAcquireParams * params)
 {
@@ -386,21 +384,6 @@ gst_vspm_filter_caps_remove_format_info (GstCaps * caps)
   }
 
   return res;
-}
-
-/* Read the crop borders under the object lock. TRUE if they amount to a crop. */
-static gboolean
-gst_vspm_filter_get_crop_value (GstVspmFilter * space, guint * left, guint * right,
-    guint * top, guint * bottom)
-{
-  GST_OBJECT_LOCK (space);
-  *left   = space->crop.left;
-  *right  = space->crop.right;
-  *top    = space->crop.top;
-  *bottom = space->crop.bottom;
-  GST_OBJECT_UNLOCK (space);
-
-  return (*left || *right || *top || *bottom);
 }
 
 /* Round each crop border DOWN to align with YUV specification, using whichever of
@@ -600,159 +583,6 @@ gst_vspm_filter_transform_meta (GstBaseTransform * trans, GstBuffer * outbuf,
   return ret;
 }
 
-struct extensions_t
-{
-  GstVideoFormat gst_format;
-  guint vsp_format;
-  guint vsp_swap;
-};
-
-/* Note that below swap information will be REVERSED later (in function
- *     set_colorspace) because current system use Little Endian */
-static const struct extensions_t exts[] = {
-  {GST_VIDEO_FORMAT_NV12,  VSP_IN_YUV420_SEMI_NV12,  VSP_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
-  {GST_VIDEO_FORMAT_I420,  VSP_IN_YUV420_PLANAR,     VSP_SWAP_NO},    /* I420 is second priority */
-  {GST_VIDEO_FORMAT_Y42B,  VSP_IN_YUV422_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YUY2,  VSP_IN_YUV422_INT0_YUY2,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_UYVY,  VSP_IN_YUV422_INT0_UYVY,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBx,  VSP_IN_RGBA8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRx,  VSP_IN_ARGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Not supported in VSP. Use ARGB8888, and swap ARGB -> RABG -> BGRA */
-  {GST_VIDEO_FORMAT_xRGB,  VSP_IN_ARGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_xBGR,  VSP_IN_ABGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBA,  VSP_IN_RGBA8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRA,  VSP_IN_ARGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Same as BGRA */
-  {GST_VIDEO_FORMAT_ARGB,  VSP_IN_ARGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_ABGR,  VSP_IN_ABGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB ,  VSP_IN_RGB888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGR ,  VSP_IN_BGR888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YVYU,  VSP_IN_YUV422_INT0_YVYU,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_Y444,  VSP_IN_YUV444_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV21,  VSP_IN_YUV420_SEMI_NV21,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_v308,  VSP_IN_YUV444_INTERLEAVED,VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB16, VSP_IN_RGB565,            VSP_SWAP_B},
-  {GST_VIDEO_FORMAT_NV16,  VSP_IN_YUV422_SEMI_NV16,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV24,  VSP_IN_YUV444_SEMI_PLANAR,VSP_SWAP_NO},
-};
-
-static const struct extensions_t exts_out[] = {
-  {GST_VIDEO_FORMAT_NV12,  VSP_OUT_YUV420_SEMI_NV12,  VSP_SWAP_NO},    /* NV12 format is highest priority as most modules support this */
-  {GST_VIDEO_FORMAT_I420,  VSP_OUT_YUV420_PLANAR,     VSP_SWAP_NO},    /* I420 is second priority */
-  {GST_VIDEO_FORMAT_Y42B,  VSP_OUT_YUV422_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YUY2,  VSP_OUT_YUV422_INT0_YUY2,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_UYVY,  VSP_OUT_YUV422_INT0_UYVY,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBx,  VSP_OUT_RGBP8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRx,  VSP_OUT_PRGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Not supported in VSP. Use ARGB8888, and swap ARGB -> RABG -> BGRA */
-  {GST_VIDEO_FORMAT_xRGB,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_xBGR,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGBA,  VSP_OUT_RGBP8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGRA,  VSP_OUT_PRGB8888,          VSP_SWAP_B | VSP_SWAP_W},  /* Same as BGRA */
-  {GST_VIDEO_FORMAT_ARGB,  VSP_OUT_PRGB8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_ABGR,  VSP_OUT_PBGR8888,          VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB ,  VSP_OUT_RGB888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_BGR ,  VSP_OUT_BGR888,            VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_YVYU,  VSP_OUT_YUV422_INT0_YVYU,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_Y444,  VSP_OUT_YUV444_PLANAR,     VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV21,  VSP_OUT_YUV420_SEMI_NV21,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_v308,  VSP_OUT_YUV444_INTERLEAVED,VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_RGB16, VSP_OUT_RGB565,            VSP_SWAP_B},
-  {GST_VIDEO_FORMAT_NV16,  VSP_OUT_YUV422_SEMI_NV16,  VSP_SWAP_NO},
-  {GST_VIDEO_FORMAT_NV24,  VSP_OUT_YUV444_SEMI_PLANAR,VSP_SWAP_NO},
-};
-
-static gint
-set_colorspace (GstVideoFormat vid_fmt, guint * format, guint * fswap)
-{
-  int nr_exts = sizeof (exts) / sizeof (exts[0]);
-  int i;
-
-  for (i = 0; i < nr_exts; i++) {
-    if (vid_fmt == exts[i].gst_format) {
-      *format = exts[i].vsp_format;
-
-      /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts[i].vsp_swap;
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static gint
-set_colorspace_output (GstVideoFormat vid_fmt, guint * format, guint * fswap)
-{
-  int nr_exts = sizeof (exts_out) / sizeof (exts_out[0]);
-  int i;
-
-  for (i = 0; i < nr_exts; i++) {
-    if (vid_fmt == exts_out[i].gst_format) {
-      *format = exts_out[i].vsp_format;
-
-      /* Need to reverse swap information for Little Endian */
-      *fswap  = (VSP_SWAP_B | VSP_SWAP_W | VSP_SWAP_L | VSP_SWAP_LL) ^ exts_out[i].vsp_swap;
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static void
-gst_vspm_filter_set_buffer_info (GstVspmFilter * space, VspmBufferInfo * buf_info,
-    GstVideoInfo * info, GstVideoAlignment * align)
-{
-  gint i;
-
-  if (!buf_info) {
-    GST_ERROR_OBJECT (space, "buf_info is NULL");
-    return;
-  }
-
-  if (info != NULL) {
-    buf_info->width = GST_VIDEO_INFO_WIDTH (info);
-    buf_info->height = GST_VIDEO_INFO_HEIGHT (info);
-    buf_info->format = GST_VIDEO_FORMAT_INFO_FORMAT (info->finfo);
-    buf_info->n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES (info->finfo);
-    for (i = 0; i < buf_info->n_planes; i++) {
-      buf_info->plane_width[i] =
-          GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (info->finfo, i, info->width);
-      buf_info->plane_height[i] =
-          GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (info->finfo, i, info->height);
-      buf_info->plane_pixel_stride[i] =
-          GST_VIDEO_FORMAT_INFO_PSTRIDE (info->finfo, i);
-    }
-  }
-
-  buf_info->buf_size = 0;
-  memset (buf_info->plane_stride, 0, sizeof (buf_info->plane_stride));
-  memset (buf_info->plane_size  , 0, sizeof (buf_info->plane_size));
-  memset (buf_info->plane_offset, 0, sizeof (buf_info->plane_offset));
-
-  for (i = 0; i < buf_info->n_planes; i++) {
-    gint stride = buf_info->plane_width[i] * buf_info->plane_pixel_stride[i];
-    gint sliceheight = buf_info->plane_height[i];
-
-    buf_info->plane_offset[i] = buf_info->buf_size;
-
-    /* If we have alignment requirement from downstream */
-    if (align) {
-      /* FIXME: Currently, we ignore padding and only update stride */
-
-      /* According to the implementation of Gstreamer, stride_align, logically,
-       * must be a number equal to 2^N-1 instead of 2^N. Downstream proposes
-       * alignment as 2^N in the older versions and 2^N-1 in the new version.
-       * So, we should round the alignment up before using to get the same
-       * result for both cases */
-      stride = GST_ROUND_UP_N(stride, GST_ROUND_UP_2(align->stride_align[i]));
-    } else {
-      GST_DEBUG_OBJECT (space, "No stride alignment requirement from downstream");
-    }
-    buf_info->plane_stride[i] = stride;
-    buf_info->plane_size[i] = stride * sliceheight;
-
-    buf_info->buf_size += buf_info->plane_size[i];
-  }
-  return;
-}
-
 static void
 gst_vspm_filter_free_buffer_pools (GstVspmFilter * space)
 {
@@ -833,6 +663,10 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
 
   GST_DEBUG ("reconfigured %d %d", GST_VIDEO_INFO_FORMAT (in_info),
       GST_VIDEO_INFO_FORMAT (out_info));
+
+  if (!space->ops->set_info (filter, incaps, in_info, outcaps, out_info))
+    goto format_mismatch;
+
   if(space->outbuf_allocate) {
     VspmBufferInfo *out_buf_info;
 
@@ -845,7 +679,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     out_buf_info =
         &GST_VSPMFILTER_BUFFER_POOL_CAST (space->out_gst_pool)->buf_info;
 
-    gst_vspm_filter_set_buffer_info (space, out_buf_info, out_info, NULL);
+    space->ops->set_buffer_info (space, out_buf_info, out_info, NULL);
 
     structure = gst_buffer_pool_get_config (space->out_gst_pool);
     gst_buffer_pool_config_set_params(structure, outcaps,
@@ -874,7 +708,7 @@ gst_vspm_filter_set_info (GstVideoFilter * filter,
     in_buf_info =
         &GST_VSPMFILTER_BUFFER_POOL_CAST (space->in_gst_pool)->buf_info;
 
-    gst_vspm_filter_set_buffer_info (space, in_buf_info, in_info, NULL);
+    space->ops->set_buffer_info (space, in_buf_info, in_info, NULL);
 
     structure = gst_buffer_pool_get_config (space->in_gst_pool);
     /* Let upstream decide the number of buffers it needs */
@@ -959,7 +793,7 @@ gst_vspm_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
         }
       }
 
-      gst_vspm_filter_set_buffer_info (space, out_buf_info, NULL, &align);
+      space->ops->set_buffer_info (space, out_buf_info, NULL, &align);
 
       structure = gst_buffer_pool_get_config (space->out_gst_pool);
       gst_buffer_pool_config_get_params(structure, &caps, NULL, NULL, NULL);
@@ -1097,13 +931,85 @@ gst_vspmfilter_change_state (GstElement * element, GstStateChange transition)
 }
 
 static void
+append_caps_from_table (GstCaps * caps, const extensions_t * table)
+{
+  gint i;
+  gint nr = 0;
+
+  while (table[nr].gst_format != GST_VIDEO_FORMAT_UNKNOWN)
+    nr++;
+
+  for (i = 0; i < nr; i++) {
+    GstCaps *tmpcaps = gst_caps_new_simple ("video/x-raw",
+        "format", G_TYPE_STRING, gst_video_format_to_string (table[i].gst_format),
+        "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+        "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
+        "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+    gst_caps_append (caps, tmpcaps);
+  }
+}
+
+/* callback function */
+static void cb_func(
+  unsigned long uwJobId, long wResult, unsigned long uwUserData)
+{
+  sem_t *p_smpwait = (sem_t *) uwUserData;
+
+  if (wResult != 0) {
+    GST_ERROR ("VSPM: error end. (%ld)\n", wResult);
+  }
+  /* Inform frame finish to transform function */
+  sem_post (p_smpwait);
+}
+
+GstFlowReturn
+gst_vspm_filter_transform_frame (GstVideoFilter * filter,
+    GstVideoFrame * in_frame, GstVideoFrame * out_frame)
+{
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (filter);
+  GstVspmFilterVspInfo *vsp_info = space->vsp_info;
+  VSPM_IP_PAR ip_par;
+  GstFlowReturn ret;
+  gboolean submit = TRUE;
+  long ercd;
+
+  /* The platform file builds the per-frame IP parameters into ip_par; the
+   * Entry, the completion wait and the fd drain live here, next to the other
+   * VSPM_lib_* calls (DriverInitialize/GetHwType/DriverQuit). */
+  ret = space->ops->transform_frame_options (filter, in_frame, out_frame,
+      &ip_par, &submit);
+
+  if (ret == GST_FLOW_OK && submit) {
+    ercd = VSPM_lib_Entry (vsp_info->vspm_handle, &vsp_info->jobid, 126,
+        &ip_par, (unsigned long)&space->smp_wait, cb_func);
+    if (ercd) {
+      GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
+      ret = GST_FLOW_ERROR;
+    } else {
+      /* Wait for callback */
+      do {
+        ercd = sem_wait (&space->smp_wait);
+      } while (ercd != 0 && errno == EINTR);
+      if (ercd != 0) {
+        GST_ERROR ("sem_wait() Failed!! ercd=%ld\n", (long)ercd);
+        ret = GST_FLOW_ERROR;
+      }
+    }
+  }
+
+  /* Release the importing done by get_mem_phys_addr() to avoid leak FD.
+   * The drain lives here (common), not in the platform files, so the
+   * import/release pair stays in one layer. */
+  gst_vspm_filter_release_fd (space->mmngr_import_list);
+
+  return ret;
+}
+
+static void
 gst_vspm_filter_class_init (GstVspmFilterClass * klass)
 {
-  int nr_exts;
-  int i;
   GstCaps* incaps;
   GstCaps* outcaps;
-  GstCaps* tmpcaps;
   GstPadTemplate* gst_vspm_filter_src_template;
   GstPadTemplate* gst_vspm_filter_sink_template;
 
@@ -1120,26 +1026,17 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
   incaps  = gst_caps_new_empty();
   outcaps = gst_caps_new_empty();
 
-  nr_exts = sizeof (exts) / sizeof (exts[0]);
-  for (i = 0; i < nr_exts; i++) {
-	tmpcaps = gst_caps_new_simple ("video/x-raw",
-            "format", G_TYPE_STRING, gst_video_format_to_string (exts[i].gst_format),
-            "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
-            "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
-            "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+  /* Advertise union of ISU + VSP format tables; set_info rejects formats
+   * not supported by the auto-detected platform. */
+  {
+    static const GstVspmFilterOps *const ops_variants[] =
+        { &vsp_ops, &isu_ops };
+    guint i;
 
-    gst_caps_append (incaps, tmpcaps);
-  }
-
-  nr_exts = sizeof (exts_out) / sizeof (exts_out[0]);
-  for (i = 0; i < nr_exts; i++) {
-	tmpcaps = gst_caps_new_simple ("video/x-raw",
-            "format", G_TYPE_STRING, gst_video_format_to_string (exts_out[i].gst_format),
-            "width", GST_TYPE_INT_RANGE, 1, G_MAXINT,
-            "height", GST_TYPE_INT_RANGE, 1, G_MAXINT,
-            "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
-
-    gst_caps_append (outcaps, tmpcaps);
+    for (i = 0; i < G_N_ELEMENTS (ops_variants); i++) {
+      append_caps_from_table (incaps, ops_variants[i]->exts);
+      append_caps_from_table (outcaps, ops_variants[i]->exts_out);
+    }
   }
 
   gst_vspm_filter_src_template = gst_pad_template_new ("src",
@@ -1225,6 +1122,7 @@ gst_vspm_filter_finalize (GObject * obj)
    * change_state (imported fds, both ports' buffers + pools). */
   gst_vspm_filter_free_buffer_pools (space);
 
+  g_clear_pointer (&vsp_info->cached_csc, g_free);
   if (space->vsp_info)
     g_free (space->vsp_info);
   if (space->mmngr_import_list)
@@ -1261,10 +1159,32 @@ gst_vspm_filter_init (GstVspmFilter * space)
     GST_ERROR ("MMNGR: open error. \n");
   }
 
+  /* Single-phase init: merged libvspm handles detect + init in one call.
+   * VSPM_lib_DriverInitialize trials VSP then ISU internally, returns
+   * a handle with cb_list/mutex ready. Then GetHwType tells us which
+   * ops table to use. */
   if (VSPM_lib_DriverInitialize(&vsp_info->vspm_handle) == R_VSPM_OK) {
+    int hw_type = 0;
     vsp_info->is_init_vspm = TRUE;
+
+    if (VSPM_lib_GetHwType(vsp_info->vspm_handle, &hw_type) == R_VSPM_OK) {
+      if (hw_type == VSPM_TYPE_VSP_AUTO) {
+        space->ops = &vsp_ops;
+        GST_INFO ("VSPM: Detected VSP hardware");
+      } else if (hw_type == VSPM_TYPE_ISU_AUTO) {
+        space->ops = &isu_ops;
+        GST_INFO ("VSPM: Detected ISU hardware");
+      } else {
+        GST_ERROR ("VSPM: Unknown hw type %d\n", hw_type);
+        space->ops = &isu_ops; /* fallback */
+      }
+    } else {
+      GST_ERROR ("VSPM: GetHwType failed\n");
+      space->ops = &isu_ops; /* fallback */
+    }
   } else {
     GST_ERROR ("VSPM: Error Initialized. \n");
+    space->ops = &isu_ops; /* fallback */
   }
 
   space->allocator          = gst_dmabuf_allocator_new ();
@@ -1274,6 +1194,8 @@ gst_vspm_filter_init (GstVspmFilter * space)
   space->out_gst_pool       = NULL;
   space->use_dmabuf         = FALSE;
   space->mmngr_import_list  = g_queue_new ();
+
+  vsp_info->cached_csc = NULL;
 
   /* Initialize crop to disabled */
   space->crop.left   = 0;
@@ -1441,45 +1363,6 @@ gst_vspm_filter_get_property (GObject * object, guint property_id,
 }
 
 
-/* callback function */
-static void cb_func(
-  unsigned long uwJobId, long wResult, unsigned long uwUserData)
-{
-  sem_t *p_smpwait = (sem_t *) uwUserData;
-
-  if (wResult != 0) {
-    GST_ERROR ("VSPM: error end. (%ld)\n", wResult);
-  }
-  /* Inform frame finish to transform function */
-  sem_post (p_smpwait);
-}
-
-static GstFlowReturn
-find_physical_address (GstVspmFilter *space, gpointer in_vir, gpointer *out_phy)
-{
-  struct MM_PARAM p_adr;
-  GstFlowReturn ret;
-  gint page_size, max_size_in_page;
-
-  /* change virtual address to physical address */
-  memset(&p_adr, 0, sizeof(p_adr));
-  p_adr.user_virt_addr = (unsigned long)in_vir;
-  ret = ioctl(space->vsp_info->mmngr_fd, MM_IOC_VTOP, &p_adr);
-  if (ret) {
-    GST_ERROR ("MMNGR VtoP Convert Error. \n");
-    return GST_FLOW_ERROR;
-  }
-  /* Note that this method to find physical address may only find the address at
-   * start of page. If there is an offset from page, we need to add it here */
-  page_size = getpagesize ();
-  max_size_in_page = page_size - 1;
-  if ((p_adr.hard_addr & max_size_in_page) == 0)
-    p_adr.hard_addr += (max_size_in_page & (unsigned long)in_vir);
-
-  if (out_phy != NULL) *out_phy = (gpointer) p_adr.hard_addr;
-  return GST_FLOW_OK;
-}
-
 /* TRUE if the dmabuf is one physically-contiguous block: a physical address
  * resolves and the imported mapped_size covers the full mem size. */
 static gboolean
@@ -1602,397 +1485,6 @@ gst_vspm_filter_buffer_can_passthrough (GstVspmFilter * space, GstBuffer * buf)
     return FALSE;
 
   return TRUE;
-}
-
-static void
-gst_vspm_filter_import_fd (GstMemory *mem, gsize plane_offset, gpointer *out,
-    GQueue *import_list)
-{
-  int fd;
-
-  if (gst_is_dmabuf_memory(mem)) {
-    int import_pid;
-    size_t size;
-    unsigned int phys_base = 0;
-
-    fd = gst_dmabuf_memory_get_fd (mem);
-    if (R_MM_OK == mmngr_import_start_in_user_ext (&import_pid, &size,
-                                                   &phys_base, fd, NULL)) {
-      /* import returns the page-aligned base of the dmabuf; the plane data
-       * starts at mem->offset + the plane's byte offset within the buffer
-       * (non-zero for packed multi-plane formats sharing one dmabuf) */
-      *out = (gpointer) ((unsigned long) phys_base + mem->offset + plane_offset);
-      g_queue_push_tail (import_list, GINT_TO_POINTER(import_pid));
-    }
-  }
-}
-
-static void
-gst_vspm_filter_release_fd (GQueue *import_list)
-{
-  int fd;
-  while (!g_queue_is_empty(import_list)) {
-    fd = GPOINTER_TO_INT(g_queue_pop_tail (import_list));
-    if (fd >= 0 )
-      mmngr_import_end_in_user_ext (fd);
-  }
-}
-
-static GstFlowReturn
-gst_vspm_filter_get_mem_phys_addr (GstVspmFilter * space, GstBuffer * buf,
-    gpointer vir_addr, guint plane, gsize plane_offset, gpointer * out_phy)
-{
-  GstMemory *mem = NULL;
-  guint n_mem;
-  guint mem_idx;
-  gsize offs;
-
-  *out_phy = NULL;
-
-  if (!buf)
-    return GST_FLOW_ERROR;
-
-  find_physical_address (space, vir_addr, out_phy);
-  if (*out_phy != NULL)
-    return GST_FLOW_OK;
-
-  /* A single memory packs all planes (use memory 0 at the plane's byte offset);
-   * otherwise there is one memory per plane, each starting at its own base. */
-  n_mem   = gst_buffer_n_memory (buf);
-  mem_idx = (n_mem == 1) ? 0 : plane;
-  offs    = (n_mem == 1) ? plane_offset : 0;
-
-  if (mem_idx < n_mem)
-    mem = gst_buffer_peek_memory (buf, mem_idx);
-  if (mem != NULL) {
-    gst_vspm_filter_import_fd (mem, offs, out_phy, space->mmngr_import_list);
-    if (*out_phy != NULL)
-      return GST_FLOW_OK;
-  }
-
-  return GST_FLOW_ERROR;
-}
-
-static GstFlowReturn
-gst_vspm_filter_transform_frame (GstVideoFilter * filter,
-    GstVideoFrame * in_frame, GstVideoFrame * out_frame)
-{
-  GstVspmFilter *space;
-  GstVspmFilterVspInfo *vsp_info;
-
-  VSPM_IP_PAR vspm_ip;
-  VSPM_VSP_PAR vsp_par;
-
-  T_VSP_IN src_par;
-  T_VSP_ALPHA src_alpha_par;
-  T_VSP_OUT dst_par;
-  T_VSP_CTRL ctrl_par;
-  T_VSP_UDS uds_par;
-
-  gint in_width, in_height;
-  gint out_width, out_height;
-  long ercd;
-  gint irc;
-  unsigned long use_module;
-
-  int i;
-  GstFlowReturn ret;
-  gint stride[GST_VIDEO_MAX_PLANES];
-  gsize offset[GST_VIDEO_MAX_PLANES];
-  gint offs, plane_size;
-  const GstVideoFormatInfo * vspm_in_vinfo;
-  const GstVideoFormatInfo * vspm_out_vinfo;
-  void *src_addr[3] = { 0 };
-  void *dst_addr[3] = { 0 };
-  guint in_n_planes, out_n_planes;
-
-  space = GST_VIDEO_CONVERT_CAST (filter);
-  vsp_info = space->vsp_info;
-
-  GST_CAT_DEBUG_OBJECT (GST_CAT_PERFORMANCE, filter,
-      "doing colorspace conversion from %s -> to %s",
-      GST_VIDEO_INFO_NAME (&filter->in_info),
-      GST_VIDEO_INFO_NAME (&filter->out_info));
-
-  vsp_info->gst_format_in = GST_VIDEO_FRAME_FORMAT (in_frame);
-  vsp_info->in_width = GST_VIDEO_FRAME_COMP_WIDTH (in_frame, 0);
-  vsp_info->in_height = GST_VIDEO_FRAME_COMP_HEIGHT (in_frame, 0);
-
-  vsp_info->gst_format_out = GST_VIDEO_FRAME_FORMAT (out_frame);
-  vsp_info->out_width = GST_VIDEO_FRAME_COMP_WIDTH (out_frame, 0);
-  vsp_info->out_height = GST_VIDEO_FRAME_COMP_HEIGHT (out_frame, 0);
-
-  memset(&ctrl_par, 0, sizeof(T_VSP_CTRL));
-
-  if (vsp_info->format_flag == 0) {
-    irc = set_colorspace (GST_VIDEO_FRAME_FORMAT (in_frame), &vsp_info->in_format, &vsp_info->in_swapbit);
-    if (irc != 0) {
-      GST_ERROR("input format is non-support.\n");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-
-    irc = set_colorspace_output (GST_VIDEO_FRAME_FORMAT (out_frame), &vsp_info->out_format, &vsp_info->out_swapbit);
-    if (irc != 0) {
-      GST_ERROR("output format is non-support.\n");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-    vsp_info->format_flag = 1;
-  }
-
-  in_width = vsp_info->in_width;
-  in_height = vsp_info->in_height;
-  vspm_in_vinfo = gst_video_format_get_info (vsp_info->gst_format_in);
-
-  out_width = vsp_info->out_width;
-  out_height = vsp_info->out_height;
-  vspm_out_vinfo = gst_video_format_get_info (vsp_info->gst_format_out);
-
-  in_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_in_vinfo);
-  out_n_planes = GST_VIDEO_FORMAT_INFO_N_PLANES(vspm_out_vinfo);
-
-  guint crop_start_x   = 0;
-  guint crop_start_y   = 0;
-  guint crop_in_width  = in_width;
-  guint crop_in_height = in_height;
-  guint c_left, c_right, c_top, c_bottom;
-
-  if (gst_vspm_filter_get_crop_value (space, &c_left, &c_right, &c_top, &c_bottom)) {
-    /* Validate the requested borders against the input */
-    if ((c_left + c_right) < (guint) in_width &&
-        (c_top + c_bottom) < (guint) in_height) {
-      crop_start_x   = c_left;
-      crop_start_y   = c_top;
-      crop_in_width  = in_width  - c_left - c_right;
-      crop_in_height = in_height - c_top  - c_bottom;
-
-      GST_DEBUG_OBJECT (space,
-          "crop: start(%u,%u) cropped size(%ux%u) from input(%dx%d)",
-          crop_start_x, crop_start_y, crop_in_width, crop_in_height,
-          in_width, in_height);
-    } else {
-      /* Out of range for this input. configure_crop() already warned on the
-       * bus, so log quietly here rather than repeat it for every buffer. */
-      GST_DEBUG_OBJECT (space,
-          "crop %u:%u:%u:%u does not fit %dx%d input, skipping",
-          c_left, c_right, c_top, c_bottom, in_width, in_height);
-    }
-  }
-
-  if (((gint) crop_in_width == out_width) &&
-      ((gint) crop_in_height == out_height)) {
-    use_module = 0;
-  } else {
-    /* UDS scaling */
-    use_module = VSP_UDS_USE;
-  }
-
-  if (gst_vspm_filter_get_mem_phys_addr (space, in_frame->buffer,
-          in_frame->data[0], 0, in_frame->info.offset[0], &src_addr[0]) != GST_FLOW_OK) {
-    GST_ERROR_OBJECT (space, "no physical address for input plane 0");
-    ret = GST_FLOW_ERROR;
-    goto err;
-  }
-
-  if (gst_vspm_filter_get_mem_phys_addr (space, out_frame->buffer,
-          out_frame->data[0], 0, out_frame->info.offset[0], &dst_addr[0]) != GST_FLOW_OK) {
-    GST_ERROR_OBJECT (space, "no physical address for output plane 0");
-    ret = GST_FLOW_ERROR;
-    goto err;
-  }
-
-  if (in_n_planes >= 2) {
-    if (gst_vspm_filter_get_mem_phys_addr (space, in_frame->buffer,
-            in_frame->data[1], 1, in_frame->info.offset[1], &src_addr[1]) != GST_FLOW_OK) {
-      GST_ERROR_OBJECT (space,
-          "no physical address for input plane 1");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-  }
-
-  if (out_n_planes >= 2) {
-    if (gst_vspm_filter_get_mem_phys_addr (space, out_frame->buffer,
-            out_frame->data[1], 1, out_frame->info.offset[1], &dst_addr[1]) != GST_FLOW_OK) {
-      GST_ERROR_OBJECT (space,
-          "no physical address for output plane 1");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-  }
-
-  if (in_n_planes >= 3) {
-    if (gst_vspm_filter_get_mem_phys_addr (space, in_frame->buffer,
-            in_frame->data[2], 2, in_frame->info.offset[2], &src_addr[2]) != GST_FLOW_OK) {
-      GST_ERROR_OBJECT (space,
-          "no physical address for input plane 2");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-  }
-
-  if (out_n_planes >= 3) {
-    if (gst_vspm_filter_get_mem_phys_addr (space, out_frame->buffer,
-            out_frame->data[2], 2, out_frame->info.offset[2], &dst_addr[2]) != GST_FLOW_OK) {
-      GST_ERROR_OBJECT (space,
-          "no physical address for output plane 2");
-      ret = GST_FLOW_ERROR;
-      goto err;
-    }
-  }
-
-  if (!src_addr[0] || !dst_addr[0] ||
-      ((in_n_planes >= 2 && !src_addr[1]) || (out_n_planes >= 2 && !dst_addr[1])) ||
-      ((in_n_planes >= 3 && !src_addr[2]) || (out_n_planes >= 3 && !dst_addr[2]))) {
-    /* W/A: Sometimes we can not convert virtual address to physical address,
-     * we should skip this frame to avoid issue with HW processor.
-     */
-    ret = GST_FLOW_OK;
-    goto err;
-  }
-
-  {
-    /* Setting input parameters */
-    src_alpha_par.addr_a   = NULL;
-    src_alpha_par.alphan   = VSP_ALPHA_NO;
-    src_alpha_par.alpha1   = 0;
-    src_alpha_par.alpha2   = 0;
-    src_alpha_par.astride  = 0;
-    src_alpha_par.aswap    = VSP_SWAP_NO;
-    src_alpha_par.asel     = VSP_ALPHA_NUM5;
-    src_alpha_par.aext     = VSP_AEXT_EXPAN;
-    src_alpha_par.anum0    = 0;
-    src_alpha_par.anum1    = 0;
-    src_alpha_par.afix     = 0xff;
-    src_alpha_par.irop     = VSP_IROP_NOP;
-    src_alpha_par.msken    = VSP_MSKEN_ALPHA;
-    src_alpha_par.bsel     = 0;
-    src_alpha_par.mgcolor  = 0;
-    src_alpha_par.mscolor0 = 0;
-    src_alpha_par.mscolor1 = 0;
-
-    src_par.addr           = src_addr[0];
-    src_par.addr_c0        = src_addr[1];
-    src_par.addr_c1        = src_addr[2];
-    src_par.stride         = in_frame->info.stride[0];
-    src_par.stride_c       = in_frame->info.stride[1];
-    src_par.csc            = VSP_CSC_OFF;  /* do not convert colorspace */
-    src_par.width          = crop_in_width;
-    src_par.height         = crop_in_height;
-    src_par.width_ex       = 0;
-    src_par.height_ex      = 0;
-    src_par.x_offset       = crop_start_x;
-    src_par.y_offset       = crop_start_y;
-    src_par.format         = vsp_info->in_format;
-    src_par.swap           = vsp_info->in_swapbit;
-    src_par.x_position     = 0;
-    src_par.y_position     = 0;
-    src_par.pwd            = VSP_LAYER_PARENT;
-    src_par.cipm           = VSP_CIPM_0_HOLD;
-    src_par.cext           = VSP_CEXT_EXPAN;
-    src_par.iturbt         = VSP_ITURBT_709;
-    src_par.clrcng         = VSP_ITU_COLOR;
-    src_par.vir            = VSP_NO_VIR;
-    src_par.vircolor       = 0x00000000;
-    src_par.osd_lut        = NULL;
-    src_par.alpha_blend    = &src_alpha_par;
-    src_par.clrcnv         = NULL;
-    src_par.connect        = use_module;
-  }
-
-  {
-    /* Setting output parameters */
-    dst_par.addr           = dst_addr[0];
-    dst_par.addr_c0        = dst_addr[1];
-    dst_par.addr_c1        = dst_addr[2];
-    dst_par.stride         = out_frame->info.stride[0];
-    dst_par.stride_c       = out_frame->info.stride[1];
-
-    /* convert if format in and out different in color space */
-    if (!GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_in_vinfo) != !GST_VIDEO_FORMAT_INFO_IS_YUV(vspm_out_vinfo)) {
-      dst_par.csc          = VSP_CSC_ON;
-    } else {
-      dst_par.csc          = VSP_CSC_OFF;
-    }
-
-    dst_par.width          = out_width;
-    dst_par.height         = out_height;
-    dst_par.x_offset       = 0;
-    dst_par.y_offset       = 0;
-    dst_par.format         = vsp_info->out_format;
-    dst_par.pxa            = VSP_PAD_P;
-    dst_par.pad            = 0xff;
-    dst_par.x_coffset      = 0;
-    dst_par.y_coffset      = 0;
-    dst_par.iturbt         = VSP_ITURBT_709;
-    dst_par.clrcng         = VSP_ITU_COLOR;
-    dst_par.cbrm           = VSP_CSC_ROUND_DOWN;
-    dst_par.abrm           = VSP_CONVERSION_ROUNDDOWN;
-    dst_par.athres         = 0;
-    dst_par.clmd           = VSP_CLMD_NO;
-    dst_par.dith           = VSP_NO_DITHER;
-    dst_par.swap           = vsp_info->out_swapbit;
-  }
-
-  {
-    /* Setting resize parameters */
-    if (use_module == VSP_UDS_USE) {
-      /* Set T_VSP_UDS. */
-      ctrl_par.uds         = &uds_par;
-
-      memset(&uds_par, 0, sizeof(T_VSP_UDS));
-      uds_par.fmd          = VSP_FMD_NO;
-      uds_par.filcolor     = 0x0000FF00; /* green */
-      uds_par.amd          = VSP_AMD;
-      uds_par.clip         = VSP_CLIP_OFF;
-      uds_par.alpha        = VSP_ALPHA_ON;
-      uds_par.complement   = VSP_COMPLEMENT_BIL;
-      uds_par.athres0      = 0;
-      uds_par.athres1      = 0;
-      uds_par.anum0        = 0;
-      uds_par.anum1        = 0;
-      uds_par.anum2        = 0;
-      uds_par.x_ratio      = (unsigned short)( (crop_in_width << 12) / out_width );
-      uds_par.y_ratio      = (unsigned short)( (crop_in_height << 12) / out_height );
-      uds_par.out_cwidth   = (unsigned short)out_width;
-      uds_par.out_cheight  = (unsigned short)out_height;
-      uds_par.connect      = 0;
-    }
-  }
-
-  {
-    /* Update all settings */
-    vsp_par.rpf_num        = 1;
-    vsp_par.use_module     = use_module;
-    vsp_par.src1_par       = &src_par;
-    vsp_par.src2_par       = NULL;
-    vsp_par.src3_par       = NULL;
-    vsp_par.src4_par       = NULL;
-    vsp_par.dst_par        = &dst_par;
-    vsp_par.ctrl_par       = &ctrl_par;
-  }
-
-  memset(&vspm_ip, 0, sizeof(VSPM_IP_PAR));
-  vspm_ip.uhType             = VSPM_TYPE_VSP_AUTO;
-  vspm_ip.unionIpParam.ptVsp = &vsp_par;
-
-  ercd = VSPM_lib_Entry(vsp_info->vspm_handle, &vsp_info->jobid, 126, &vspm_ip, (unsigned long)&space->smp_wait, cb_func);
-  if (ercd) {
-    GST_ERROR ("VSPM_lib_Entry() Failed!! ercd=%ld\n", ercd);
-    ret = GST_FLOW_ERROR;
-    goto err;
-  }
-
-  /* Wait for callback */
-  sem_wait (&space->smp_wait);
-
-  ret = GST_FLOW_OK;
-err:
-  /* Release the importing to avoid leak FD */
-  gst_vspm_filter_release_fd (space->mmngr_import_list);
-
-  return ret;
 }
 
 static gboolean

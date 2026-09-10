@@ -28,6 +28,10 @@
 #include <gst/video/gstvideofilter.h>
 #include <gst/allocators/gstdmabuf.h>
 
+#include <errno.h>
+
+#include "vspm_public.h"
+
 #include <fcntl.h>              /* low-level i/o */
 #include <unistd.h>
 #include <semaphore.h>
@@ -61,6 +65,9 @@ G_BEGIN_DECLS
 #define MAX_BUFFERS (32)
 
 #define MAX_DEVICES 2
+
+#define RAW_FORMAT 0x30
+#define YUV_FORMAT 0x20
 #define MAX_ENTITIES 4
 
 /* mmngr dev name */
@@ -123,7 +130,7 @@ struct _GstVspmFilterVspInfo {
   guint  out_nplane;
   guint  out_swapbit;
   int mmngr_fd;   /* mmngr open id */
-  
+  gpointer cached_csc;
 };
 
 typedef struct {
@@ -153,6 +160,58 @@ typedef struct {
   gint  plane_size[GST_VIDEO_MAX_PLANES];
 } VspmBufferInfo;
 
+/* Format table entry (platform files) */
+typedef struct {
+  GstVideoFormat gst_format;
+  guint hw_format;
+  guint hw_swap;
+} extensions_t;
+
+/**
+ * GstVspmFilterOps:
+ *
+ * Operations table for hardware-specific implementations.
+ * Populated at init time based on auto-detected hardware type.
+ */
+typedef struct _GstVspmFilterOps {
+  /* Build the per-frame IP parameters (ISU: T_ISU_IN/OUT/RS + crop, VSP:
+   * T_VSP_IN/OUT/UDS) into *ip_par. The core then submits *ip_par to
+   * VSPM_lib_Entry() and waits for the completion callback. Set *submit
+   * to FALSE to skip the frame without touching the hardware. */
+  GstFlowReturn (*transform_frame_options) (GstVideoFilter * filter,
+                                         GstVideoFrame * in_frame,
+                                         GstVideoFrame * out_frame,
+                                         VSPM_IP_PAR * ip_par,
+                                         gboolean * submit);
+
+  /* Set info -- platform part (ISU: pre-compute CSC + format reject) */
+  gboolean      (*set_info)             (GstVideoFilter * filter,
+                                         GstCaps * incaps,
+                                         GstVideoInfo * in_info,
+                                         GstCaps * outcaps,
+                                         GstVideoInfo * out_info);
+
+  /* Format lookup for input */
+  gint          (*set_colorspace)       (GstVideoFormat vid_fmt,
+                                         guint * format,
+                                         guint * fswap);
+
+  /* Format lookup for output */
+  gint          (*set_colorspace_output)(GstVideoFormat vid_fmt,
+                                         guint * format,
+                                         guint * fswap);
+
+  /* Stride alignment (ISU: 32/512 + GRAY10 + UV follows Y, VSP: downstream only) */
+  void          (*set_buffer_info)      (GstVspmFilter * space,
+                                         VspmBufferInfo * buf_info,
+                                         GstVideoInfo * vinfo,
+                                         GstVideoAlignment * align);
+
+  /* Format tables owned by the platform file (read by core via ops only) */
+  const extensions_t *exts;
+  const extensions_t *exts_out;
+} GstVspmFilterOps;
+
 struct _GstVspmFilterBufferPool
 {
   GstBufferPool bufferpool;
@@ -167,6 +226,26 @@ struct _GstVspmFilterBufferPoolClass
 {
   GstBufferPoolClass parent_class;
 };
+
+/* Transform parameter blocks owned by the instance. The platform file fills
+ * these through stack copies and re-points the internal references to the
+ * storage before the core submits them to VSPM_lib_Entry(). */
+typedef struct {
+  VSPM_ISU_PAR start;
+  T_ISU_IN     src;
+  T_ISU_ALPHA  src_alpha;
+  T_ISU_OUT    dst;
+  T_ISU_RS     rs;
+} GstVspmFilterIsuParams;
+
+typedef struct {
+  VSPM_VSP_PAR start;
+  T_VSP_IN     src;
+  T_VSP_ALPHA  src_alpha;
+  T_VSP_OUT    dst;
+  T_VSP_CTRL   ctrl;
+  T_VSP_UDS    uds;
+} GstVspmFilterVspParams;
 
 /**
  * GstVspmFilter:
@@ -185,6 +264,11 @@ struct _GstVspmFilter {
   GstBufferPool  *out_gst_pool;
   GQueue *mmngr_import_list;
   sem_t smp_wait;
+  const GstVspmFilterOps *ops;
+  union {
+    GstVspmFilterIsuParams isu;
+    GstVspmFilterVspParams vsp;
+  } ip_params;
   /* Crop borders from the "crop" property; all zeroes means no crop. */
   struct {
     guint32 left;
@@ -202,6 +286,22 @@ struct _GstVspmFilterClass
 };
 
 GType gst_vspmfilter_buffer_pool_get_type (void);
+
+/* Platform ops tables */
+extern const GstVspmFilterOps vsp_ops;
+extern const GstVspmFilterOps isu_ops;
+
+/* Cross-file helpers (common -> platform) */
+gboolean gst_vspm_filter_get_crop_value (GstVspmFilter * space, guint * left,
+    guint * right, guint * top, guint * bottom);
+GstFlowReturn gst_vspm_filter_get_mem_phys_addr (GstVspmFilter * space,
+    GstBuffer * buf, gpointer vir_addr, guint plane, gsize plane_offset,
+    gpointer * out_phy);
+void gst_vspm_filter_import_fd (GstMemory * mem, gsize plane_offset,
+    gpointer * out, GQueue * import_list);
+void gst_vspm_filter_release_fd (GQueue * import_list);
+GstFlowReturn find_physical_address (GstVspmFilter * space, gpointer in_vir,
+    gpointer * out_phy);
 
 G_END_DECLS
 

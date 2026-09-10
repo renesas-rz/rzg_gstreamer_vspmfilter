@@ -95,6 +95,28 @@ PKG_CHECK_MODULES([GST_VIDEO],
 PKG_CHECK_MODULES([GST_ALLOCATORS],
     [gstreamer-allocators-$GST_PKG_VERSION >= $GSTPB_REQ])
 
+dnl Check for GST_VIDEO_FORMAT_GRAY10_LE64 in gst/video/video-format.h
+AC_MSG_CHECKING([for GST_VIDEO_FORMAT_GRAY10_LE64 in gst/video/video-format.h])
+AC_LANG_PUSH([C])
+CFLAGS_backup=$CFLAGS
+LDFLAGS_backup=$LDFLAGS
+CFLAGS="$CFLAGS $GST_VIDEO_CFLAGS"
+LDFLAGS="$LDFLAGS $GST_VIDEO_LIBS"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+    #include <gst/video/video-format.h>
+]], [[
+    GstVideoFormat format = GST_VIDEO_FORMAT_GRAY10_LE64;
+    return (int)format;
+]])], [
+    AC_DEFINE([HAS_GRAY10_LE64], [1], [Define if GST_VIDEO_FORMAT_GRAY10_LE64 is available])
+    AC_MSG_RESULT([yes])
+], [
+    AC_MSG_RESULT([no])
+])
+CFLAGS=$CFLAGS_backup
+LDFLAGS=$LDFLAGS_backup
+AC_LANG_POP([C])
+
 dnl Check for the GStreamer plugins directory
 AC_ARG_VAR([GST_PLUGIN_PATH], [installation path for gstreamer-vspmfilter plugin elements])
 AC_MSG_CHECKING([for GStreamer plugins directory])

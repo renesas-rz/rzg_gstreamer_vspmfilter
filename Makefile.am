@@ -1,6 +1,9 @@
 plugin_LTLIBRARIES = libgstvspmfilter.la
 
-libgstvspmfilter_la_SOURCES =  gstvspmfilter.c
+libgstvspmfilter_la_SOURCES =  gstvspmfilter.c \
+	gstvspmfilter_common.c \
+	gstvspmfilter_vsp.c \
+	gstvspmfilter_isu.c
 
 libgstvspmfilter_la_CFLAGS = \
 	$(GST_PLUGINS_BASE_CFLAGS) \
