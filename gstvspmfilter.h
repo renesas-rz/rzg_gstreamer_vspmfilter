@@ -85,7 +85,7 @@ struct MM_PARAM {
 
 /* mmngr private define */
 #define MM_IOC_MAGIC 'm'
-#define MM_IOC_VTOP	_IOWR(MM_IOC_MAGIC, 7, struct MM_PARAM) 
+#define MM_IOC_VTOP	_IOWR(MM_IOC_MAGIC, 9, struct MM_PARAM)
 
 typedef struct _GstVspmFilter GstVspmFilter;
 typedef struct _GstVspmFilterClass GstVspmFilterClass;
