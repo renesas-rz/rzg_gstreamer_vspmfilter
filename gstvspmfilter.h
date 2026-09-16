@@ -265,6 +265,10 @@ struct _GstVspmFilter {
   GQueue *mmngr_import_list;
   sem_t smp_wait;
   const GstVspmFilterOps *ops;
+  /* Caps of the detected hardware per pad (built in _init from the ops
+   * tables); the pad templates stay the union of both platforms. */
+  GstCaps *hw_caps_sink;
+  GstCaps *hw_caps_src;
   union {
     GstVspmFilterIsuParams isu;
     GstVspmFilterVspParams vsp;

@@ -74,6 +74,10 @@ static gboolean gst_vspm_filter_parse_cropsize (GObject * object,
     const GValue * value, guint32 * left, guint32 * right, guint32 * top,
     guint32 * bottom);
 static void append_caps_from_table (GstCaps * caps, const extensions_t * table);
+static GstCaps *gst_vspm_filter_get_hw_caps (GstVspmFilter * space,
+    GstPadDirection direction);
+static gboolean gst_vspm_filter_accept_caps (GstBaseTransform * trans,
+    GstPadDirection direction, GstCaps * caps);
 static GstFlowReturn gst_vspm_filter_transform_frame (GstVideoFilter * filter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame);
 static void gst_vspm_filter_get_property (GObject * object,
@@ -511,8 +515,9 @@ gst_vspm_filter_filter_meta (GstBaseTransform * trans, GstQuery * query,
 }
 
 /* The caps can be transformed into any other caps with format info removed.
- * However, we should prefer passthrough, so if passthrough is possible,
- * put it first in the list. */
+ * The formats are then restricted to the table of the detected hardware on the
+ * pad the result is for: the pad templates are the union of the ISU and VSP
+ * tables, so they cannot express that per-instance limitation. */
 static GstCaps *
 gst_vspm_filter_transform_caps (GstBaseTransform * btrans,
     GstPadDirection direction, GstCaps * caps, GstCaps * filter)
@@ -520,6 +525,7 @@ gst_vspm_filter_transform_caps (GstBaseTransform * btrans,
   GstCaps *tmp, *tmp2;
   GstCaps *result;
   GstCaps *caps_full_range_sizes;
+  GstCaps *hw_caps;
   GstStructure *structure;
   gint i, n;
 
@@ -548,14 +554,20 @@ gst_vspm_filter_transform_caps (GstBaseTransform * btrans,
 
   gst_caps_unref (tmp);
 
-  if (filter) {
-    tmp2 = gst_caps_intersect_full (filter, caps_full_range_sizes,
-        GST_CAPS_INTERSECT_FIRST);
+  /* Keep only the formats the detected hardware offers on the other pad. */
+  hw_caps = gst_vspm_filter_get_hw_caps (GST_VIDEO_CONVERT_CAST (btrans),
+      (direction == GST_PAD_SINK) ? GST_PAD_SRC : GST_PAD_SINK);
+  tmp = gst_caps_intersect_full (hw_caps, caps_full_range_sizes,
+      GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref (hw_caps);
+  gst_caps_unref (caps_full_range_sizes);
 
-    gst_caps_unref (caps_full_range_sizes);
+  if (filter) {
+    tmp2 = gst_caps_intersect_full (filter, tmp, GST_CAPS_INTERSECT_FIRST);
+
+    gst_caps_unref (tmp);
     tmp = tmp2;
-  } else
-    tmp = caps_full_range_sizes;
+  }
 
   result = tmp;
 
@@ -949,6 +961,43 @@ append_caps_from_table (GstCaps * caps, const extensions_t * table)
   }
 }
 
+/* Build the caps the detected hardware can handle on this pad. The pad
+ * template advertises the union of the ISU and VSP tables because the platform
+ * is only known per instance; transform_caps() and accept_caps() narrow it down
+ * to the table of the detected platform at runtime. */
+static GstCaps *
+gst_vspm_filter_build_hw_caps (GstVspmFilter * space,
+    GstPadDirection direction)
+{
+  GstCaps *caps = gst_caps_new_empty ();
+
+  append_caps_from_table (caps, (direction == GST_PAD_SINK) ?
+      space->ops->exts : space->ops->exts_out);
+
+  return caps;
+}
+
+/* The cached hardware caps of this instance (built in _init); returns a ref. */
+static GstCaps *
+gst_vspm_filter_get_hw_caps (GstVspmFilter * space, GstPadDirection direction)
+{
+  return gst_caps_ref ((direction == GST_PAD_SINK) ?
+      space->hw_caps_sink : space->hw_caps_src);
+}
+
+static gboolean
+gst_vspm_filter_accept_caps (GstBaseTransform * trans,
+    GstPadDirection direction, GstCaps * caps)
+{
+  GstVspmFilter *space = GST_VIDEO_CONVERT_CAST (trans);
+  GstCaps *hw_caps = gst_vspm_filter_get_hw_caps (space, direction);
+  gboolean ret = gst_caps_is_subset (caps, hw_caps);
+
+  gst_caps_unref (hw_caps);
+
+  return ret;
+}
+
 /* callback function */
 static void cb_func(
   unsigned long uwJobId, long wResult, unsigned long uwUserData)
@@ -1023,11 +1072,15 @@ gst_vspm_filter_class_init (GstVspmFilterClass * klass)
   gobject_class->get_property = gst_vspm_filter_get_property;
   gobject_class->finalize = gst_vspm_filter_finalize;
 
+  gstbasetransform_class->accept_caps =
+      GST_DEBUG_FUNCPTR (gst_vspm_filter_accept_caps);
+
   incaps  = gst_caps_new_empty();
   outcaps = gst_caps_new_empty();
 
-  /* Advertise union of ISU + VSP format tables; set_info rejects formats
-   * not supported by the auto-detected platform. */
+  /* The template advertises the union of the ISU and VSP format tables; the
+   * platform is only known per instance, so transform_caps() and accept_caps()
+   * narrow it down to the table of the detected hardware at runtime. */
   {
     static const GstVspmFilterOps *const ops_variants[] =
         { &vsp_ops, &isu_ops };
@@ -1122,6 +1175,9 @@ gst_vspm_filter_finalize (GObject * obj)
    * change_state (imported fds, both ports' buffers + pools). */
   gst_vspm_filter_free_buffer_pools (space);
 
+  gst_caps_replace (&space->hw_caps_sink, NULL);
+  gst_caps_replace (&space->hw_caps_src, NULL);
+
   g_clear_pointer (&vsp_info->cached_csc, g_free);
   if (space->vsp_info)
     g_free (space->vsp_info);
@@ -1186,6 +1242,11 @@ gst_vspm_filter_init (GstVspmFilter * space)
     GST_ERROR ("VSPM: Error Initialized. \n");
     space->ops = &isu_ops; /* fallback */
   }
+
+  /* Cache the caps of the detected platform: the pad templates are the union
+   * of both platforms and cannot be narrowed down per instance. */
+  space->hw_caps_sink = gst_vspm_filter_build_hw_caps (space, GST_PAD_SINK);
+  space->hw_caps_src  = gst_vspm_filter_build_hw_caps (space, GST_PAD_SRC);
 
   space->allocator          = gst_dmabuf_allocator_new ();
   space->outbuf_allocate    = FALSE;
